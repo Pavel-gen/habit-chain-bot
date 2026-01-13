@@ -1,5 +1,10 @@
 // src/bot/bot.service.ts
-import { Injectable, OnModuleDestroy, OnModuleInit, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  OnModuleDestroy,
+  OnModuleInit,
+  Logger,
+} from '@nestjs/common';
 import { Telegraf, session, Scenes, Markup } from 'telegraf';
 import { message } from 'telegraf/filters';
 import { PrismaService } from '../prisma/prisma.service';
@@ -28,8 +33,8 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       async (ctx: any) => {
         await ctx.replyWithHTML(
           `🤔 <b>Какую активность будем отслеживать?</b>\n\n` +
-          `Примеры:\n- Качалка\n- Чтение 20 стр.\n- Пить воду 2л\n\n` +
-          `Отправьте /cancel чтобы отменить`
+            `Примеры:\n- Качалка\n- Чтение 20 стр.\n- Пить воду 2л\n\n` +
+            `Отправьте /cancel чтобы отменить`,
         );
         return ctx.wizard.next();
       },
@@ -66,14 +71,22 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         // Предлагаем выбрать эмодзи
         await ctx.replyWithHTML(
           `🎨 <b>Выберите эмодзи для "${name}"</b>\n\n` +
-          `Нажмите на эмодзи или отправьте /skip чтобы пропустить:`,
+            `Нажмите на эмодзи или отправьте /skip чтобы пропустить:`,
           Markup.inlineKeyboard([
-            [Markup.button.callback('🏋️', 'emoji_🏋️'), Markup.button.callback('📚', 'emoji_📚'), Markup.button.callback('🧘', 'emoji_🧘')],
-            [Markup.button.callback('💧', 'emoji_💧'), Markup.button.callback('🏃', 'emoji_🏃'), Markup.button.callback('🍎', 'emoji_🍎')],
-            [Markup.button.callback('➡️ Пропустить', 'skip_emoji')]
-          ])
+            [
+              Markup.button.callback('🏋️', 'emoji_🏋️'),
+              Markup.button.callback('📚', 'emoji_📚'),
+              Markup.button.callback('🧘', 'emoji_🧘'),
+            ],
+            [
+              Markup.button.callback('💧', 'emoji_💧'),
+              Markup.button.callback('🏃', 'emoji_🏃'),
+              Markup.button.callback('🍎', 'emoji_🍎'),
+            ],
+            [Markup.button.callback('➡️ Пропустить', 'skip_emoji')],
+          ]),
         );
-      }
+      },
     );
 
     // Обработка callback-кнопок (эмодзи)
@@ -100,14 +113,33 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     });
 
     // === Сцена списка (заглушка) ===
-    const markHabitsScene = new Scenes.BaseScene('MARK_HABITS_SCENE');
-    markHabitsScene.enter(async (ctx: any) => {
-      await ctx.reply('⚠️ Сцена отметки привычек пока в разработке');
+    const markHabitsWizard = new Scenes.WizardScene(
+      'MARK_HABITS_SCENE',
+      async (ctx: any) => {
+        await this.showHabitsList(ctx);
+      },
+    );
+
+    // Обработка нажатия на кнопку привычки
+    markHabitsWizard.action(/toggle_habit_(\d+)/, async (ctx: any) => {
+      const habitId = parseInt(ctx.match[1], 10);
+      await this.toggleHabitRecord(ctx, habitId);
+      await this.showHabitsList(ctx); // обновляем список
+    });
+
+    markHabitsWizard.action('cancel_list', async (ctx: any) => {
       await ctx.scene.leave();
+      await ctx.reply('❌ Вы вышли из режима отметки привычек.');
+    });
+
+    // Обработка команды /cancel внутри сцены
+    markHabitsWizard.command('cancel', async (ctx: any) => {
+      await ctx.scene.leave();
+      await ctx.reply('❌ Отметка привычек отменена.');
     });
 
     // Регистрация сцен
-    this.stage.register(addHabitWizard, markHabitsScene);
+    this.stage.register(addHabitWizard, markHabitsWizard);
   }
 
   private async saveHabit(ctx: any, name: string, emoji: string) {
@@ -118,8 +150,8 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       });
       await ctx.replyWithHTML(
         `✅ <b>Добавлена активность</b>\n` +
-        `"${habit.name}" ${habit.emoji || ''}\n\n` +
-        `Теперь отмечай выполнение в /list каждый день!`
+          `"${habit.name}" ${habit.emoji || ''}\n\n` +
+          `Теперь отмечай выполнение в /list каждый день!`,
       );
     } catch (err) {
       this.logger.error(`Ошибка при сохранении привычки: ${err.message}`);
@@ -145,11 +177,11 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       await this.ensureUserExists(ctx.from.id);
       await ctx.replyWithHTML(
         `🏆 <b>HabitChain</b>\n` +
-        `Твои цепочки привычек\n\n` +
-        `Команды:\n` +
-        `/add - Добавить активность\n` +
-        `/list - Мои активности\n` +
-        `/progress - Посмотреть прогресс`
+          `Твои цепочки привычек\n\n` +
+          `Команды:\n` +
+          `/add - Добавить активность\n` +
+          `/list - Мои активности\n` +
+          `/progress - Посмотреть прогресс`,
       );
     });
 
@@ -175,6 +207,103 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       this.logger.error('❌ Ошибка при запуске Telegram бота:', error);
       throw error;
     }
+  }
+
+  private async showHabitsList(ctx: any) {
+    const userId = ctx.from.id.toString();
+    const today = new Date();
+    today.setHours(0, 0, 0, 0); // начало дня
+
+    // Получаем все привычки + записи за сегодня
+    const habits = await this.prisma.habit.findMany({
+      where: { userId },
+      include: {
+        records: {
+          where: { date: today },
+        },
+      },
+    });
+
+    if (habits.length === 0) {
+      await ctx.reply('📭 У вас пока нет активностей. Добавьте через /add');
+      await ctx.scene.leave();
+      return;
+    }
+
+    let text = `📆 <b>Сегодня, ${today.toLocaleDateString('ru-RU')}</b>\n\n`;
+    const buttons: any[] = [];
+
+    for (const habit of habits) {
+      const record = habit.records[0]; // максимум одна запись за день (unique constraint)
+      const done = record?.done ?? false;
+      const mark = done ? '✅' : '❌';
+      text += `${mark} ${habit.emoji || ''} ${habit.name}\n`;
+
+      // Кнопка для переключения
+      buttons.push(
+        Markup.button.callback(
+          `${done ? '✅' : '⬜'} ${habit.name}`,
+          `toggle_habit_${habit.id}`,
+        ),
+      );
+    }
+
+    buttons.push(Markup.button.callback('❌ Отмена', 'cancel_list'));
+
+    text += `\nНажмите на привычку, чтобы отметить/снять отметку.`;
+
+    // Группируем кнопки по 1 в строке (можно по 2, если короткие названия)
+    const keyboard = Markup.inlineKeyboard(buttons.map((b) => [b]));
+
+    // Редактируем сообщение, если оно уже есть; иначе отправляем новое
+    if (ctx.wizard.state.messageId) {
+      try {
+        await ctx.editMessageText(text, { parse_mode: 'HTML', ...keyboard });
+        return;
+      } catch (e) {
+        // Игнорируем ошибку "message not modified"
+      }
+    }
+
+    const sent = await ctx.replyWithHTML(text, keyboard);
+    ctx.wizard.state.messageId = sent.message_id;
+  }
+
+  private async toggleHabitRecord(ctx: any, habitId: number) {
+    const userId = ctx.from.id.toString();
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    // Проверяем, принадлежит ли привычка пользователю
+    const habit = await this.prisma.habit.findFirst({
+      where: { id: habitId, userId },
+    });
+
+    if (!habit) {
+      await ctx.answerCbQuery('⚠️ Привычка не найдена.', true);
+      return;
+    }
+
+    // Находим или создаём запись на сегодня
+    const existingRecord = await this.prisma.habitRecord.findUnique({
+      where: { habitId_date: { habitId, date: today } },
+    });
+
+    if (existingRecord) {
+      // Переключаем статус
+      const newDone = !existingRecord.done;
+      await this.prisma.habitRecord.update({
+        where: { id: existingRecord.id },
+        data: { done: newDone },
+      });
+    } else {
+      // Создаём новую запись (по умолчанию done = false → сразу делаем true)
+      await this.prisma.habitRecord.create({
+        data: { habitId, date: today, done: true },
+      });
+    }
+
+    await ctx.answerCbQuery(); // подтверждаем нажатие
   }
 
   async onModuleDestroy() {
