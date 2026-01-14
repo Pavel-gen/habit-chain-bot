@@ -169,13 +169,12 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
           text,
           Markup.inlineKeyboard(buttons.map((b) => [b])),
         );
-        return ctx.wizard.next();
       },
 
-      async (ctx: any) => {
-        await ctx.reply('Загрузка прогресса...');
-        await ctx.scene.leave();
-      },
+      // async (ctx: any) => {
+      //   await ctx.reply('Загрузка прогресса...');
+      //   await ctx.scene.leave();
+      // },
     );
 
     progressWizard.command('cancel', async (ctx: any) => {
@@ -294,6 +293,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
       await ctx.editMessageText(calendarText, { parse_mode: 'HTML' });
       await ctx.answerCbQuery();
+      ctx.scene.leave();
     });
 
     // Регистрация сцен
@@ -333,6 +333,13 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     // Основные команды
     this.bot.command('start', async (ctx: any) => {
       await this.ensureUserExists(ctx.from.id);
+
+      const keyboard = Markup.keyboard([
+        ['/add ➕', '/list 📋'],
+        ['/progress 📊', '/cancel ℹ'],
+      ])
+        .resize() // подстраивает размер под содержимое
+        .oneTime(false); // клавиатура остаётся постоянно (не исчезает после нажатия
       await ctx.replyWithHTML(
         `🏆 <b>HabitChain</b>\n` +
           `Твои цепочки привычек\n\n` +
@@ -340,6 +347,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
           `/add - Добавить активность\n` +
           `/list - Мои активности\n` +
           `/progress - Посмотреть прогресс`,
+        keyboard,
       );
     });
 
