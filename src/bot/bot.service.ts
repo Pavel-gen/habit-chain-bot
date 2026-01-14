@@ -138,8 +138,166 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       await ctx.reply('❌ Отметка привычек отменена.');
     });
 
+    const progressWizard = new Scenes.WizardScene(
+      'PROGRESS_SCENE',
+      async (ctx: any) => {
+        const userId = ctx.from.id.toString();
+        const habits = await this.prisma.habit.findMany({
+          where: { userId },
+          orderBy: { createdAt: 'asc' },
+        });
+
+        if (habits.length === 0) {
+          await ctx.reply('📭 У вас нет активностей. Добавьте через /add');
+          return ctx.scene.leave();
+        }
+
+        let text = `📊 <b>Выберите активность для просмотра прогресса:</b>\n\n`;
+        const buttons: any[] = [];
+
+        habits.forEach((habit) => {
+          text += `${habit.emoji || ''} ${habit.name}\n`;
+          buttons.push(
+            Markup.button.callback(
+              `${habit.emoji || ''} ${habit.name}`,
+              `view_progress_${habit.id}`,
+            ),
+          );
+        });
+
+        await ctx.replyWithHTML(
+          text,
+          Markup.inlineKeyboard(buttons.map((b) => [b])),
+        );
+        return ctx.wizard.next();
+      },
+
+      async (ctx: any) => {
+        await ctx.reply('Загрузка прогресса...');
+        await ctx.scene.leave();
+      },
+    );
+
+    progressWizard.command('cancel', async (ctx: any) => {
+      await ctx.scene.leave();
+      await ctx.reply('❌ Отметка привычек отменена.');
+    });
+
+    progressWizard.action(/view_progress_(\d+)/, async (ctx: any) => {
+      const habitId = parseInt(ctx.match[1], 10);
+      const userId = ctx.from.id.toString();
+
+      // Проверяем, что привычка принадлежит пользователю
+      const habit = await this.prisma.habit.findFirst({
+        where: { id: habitId, userId },
+        include: { records: true },
+      });
+
+      if (!habit) {
+        await ctx.answerCbQuery('⚠️ Привычка не найдена.', true);
+        return;
+      }
+
+      // Генерируем календарь за текущий месяц
+      const now = new Date();
+      const year = now.getFullYear();
+      const month = now.getMonth(); // 0-based
+
+      // Первый и последний день месяца
+      const firstDay = new Date(year, month, 1);
+      const lastDay = new Date(year, month + 1, 0);
+
+      // Все дни месяца
+      const daysInMonth: any[] = [];
+      for (let d = firstDay.getDate(); d <= lastDay.getDate(); d++) {
+        daysInMonth.push(new Date(year, month, d));
+      }
+
+      // Преобразуем записи в Map для быстрого поиска
+      const recordMap = new Map<string, boolean>();
+      habit.records.forEach((record) => {
+        const dateStr = record.date.toISOString().split('T')[0];
+        recordMap.set(dateStr, record.done);
+      });
+
+      // Заголовок календаря
+      const monthNames = [
+        'Январь',
+        'Февраль',
+        'Март',
+        'Апрель',
+        'Май',
+        'Июнь',
+        'Июль',
+        'Август',
+        'Сентябрь',
+        'Октябрь',
+        'Ноябрь',
+        'Декабрь',
+      ];
+      let calendarText = `<b>${habit.emoji || ''} ${habit.name}</b>\n\n`;
+      calendarText += `📅 ${monthNames[month]} ${year}\n\n`;
+
+      // Дни недели
+      calendarText += 'Пн Вт Ср Чт Пт Сб Вс\n';
+
+      // Заполняем календарь
+      let weekLine = '';
+      let dayOfWeek = firstDay.getDay(); // 0 = воскресенье
+      if (dayOfWeek === 0) dayOfWeek = 7; // делаем понедельник = 1
+
+      // Пробелы до первого дня
+      for (let i = 1; i < dayOfWeek; i++) {
+        weekLine += '   ';
+      }
+
+      daysInMonth.forEach((date) => {
+        const dateStr = date.toISOString().split('T')[0];
+        const todayStr = now.toISOString().split('T')[0];
+
+        let symbol = '  '; // до начала трекинга
+
+        if (dateStr < habit.createdAt.toISOString().split('T')[0]) {
+          symbol = '  '; // ещё не начал трекать
+        } else if (dateStr === todayStr) {
+          symbol = '⏳';
+        } else if (date > now) {
+          symbol = '  '; // будущее — не показываем
+        } else {
+          const done = recordMap.get(dateStr);
+          symbol = done ? '✅' : '❌';
+        }
+
+        weekLine += symbol.padEnd(3, ' ');
+
+        // Новая строка каждые 7 дней
+        if (date.getDay() === 0 || date.getDate() === daysInMonth.length) {
+          calendarText += weekLine.trimEnd() + '\n';
+          weekLine = '';
+        }
+      });
+
+      // Статистика
+      const totalDaysTracked = habit.records.length;
+      const completedDays = habit.records.filter((r) => r.done).length;
+      const missedDays = totalDaysTracked - completedDays;
+      const completionRate =
+        totalDaysTracked > 0
+          ? Math.round((completedDays / totalDaysTracked) * 100)
+          : 0;
+
+      calendarText += `\nСтатистика:\n`;
+      calendarText += `Всего дней: ${totalDaysTracked}\n`;
+      calendarText += `Выполнено: ${completedDays} (${completionRate}%)\n`;
+      calendarText += `Пропущено: ${missedDays} (${100 - completionRate}%)\n\n`;
+      calendarText += `Легенда:\n✅ — сделано\n❌ — пропущено\n⏳ — сегодня`;
+
+      await ctx.editMessageText(calendarText, { parse_mode: 'HTML' });
+      await ctx.answerCbQuery();
+    });
+
     // Регистрация сцен
-    this.stage.register(addHabitWizard, markHabitsWizard);
+    this.stage.register(addHabitWizard, markHabitsWizard, progressWizard);
   }
 
   private async saveHabit(ctx: any, name: string, emoji: string) {
@@ -195,8 +353,10 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       await ctx.scene.enter('MARK_HABITS_SCENE');
     });
 
-    this.bot.command('progress', (ctx: any) => {
-      ctx.reply('📊 ВАШ ПРОГРЕСС\n\n⚠️ Функция в разработке.');
+    this.bot.command('progress', async (ctx: any) => {
+      await this.ensureUserExists(ctx.from.id);
+      await ctx.scene.enter('PROGRESS_SCENE');
+      // ctx.reply('📊 ВАШ ПРОГРЕСС\n\n⚠️ Функция в разработке.');
     });
 
     // Запуск
