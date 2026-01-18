@@ -5,6 +5,9 @@ import axios from 'axios';
 import * as fs from 'fs';
 import * as path from 'path';
 import { message } from 'telegraf/filters';
+import { PrismaService } from 'src/prisma/prisma.service';
+import { timeStamp } from 'console';
+
 
 @Injectable()
 export class BotService implements OnModuleInit, OnModuleDestroy {
@@ -12,7 +15,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
   private logger = new Logger(BotService.name);
   private SYSTEM_PROMPT: string;
 
-  constructor() {
+  constructor(private prisma: PrismaService) {
     const token = process.env.TELEGRAM_BOT_TOKEN;
     if (!token) {
       throw new Error('TELEGRAM_BOT_TOKEN is not defined in .env');
@@ -34,6 +37,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
     // Команда /start
     this.bot.command('start', async (ctx) => {
+      await this.ensuerUser(ctx);
       await ctx.reply(
         'Привет! Отправь мне любое сообщение, и я обработаю его через ИИ.',
       );
@@ -41,11 +45,20 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
     // Обработка всех текстовых сообщений
     this.bot.on(message('text'), async (ctx) => {
+      const user = await this.ensuerUser(ctx);
       const userMessage = ctx.message.text;
+
+      await this.prisma.message.create({
+        data: {
+          content: userMessage,
+          sender: 'user',
+          userId: user.id,
+        }
+      })
 
       try {
         const aiResponse = await this.callOpenRouter(userMessage);
-        await this.sendLongMessage(ctx, aiResponse, ctx.message.message_id);
+        await this.sendLongMessage(ctx, aiResponse, user.id);
       } catch (error) {
         this.logger.error('Ошибка при вызове OpenRouter:', error);
         await ctx.reply(
@@ -71,11 +84,19 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
   private async sendLongMessage(
     ctx: Context,
     text: string,
-    replyToId?: number,
+    userId: bigint,
   ) {
     const MAX_LENGTH = 4096;
     if (text.length <= MAX_LENGTH) {
       await ctx.reply(text);
+
+      await this.prisma.message.create({
+        data: {
+          content: text, 
+          sender: 'bot', 
+          userId,
+        }
+      })
       return;
     }
 
@@ -96,6 +117,14 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
       const chunk = text.slice(start, end).trim();
       await ctx.reply(chunk);
+
+      await this.prisma.message.create({
+        data: {
+          content: chunk, 
+          sender: 'bot', 
+          userId,
+        }
+      })
       start = end;
     }
   }
@@ -138,4 +167,31 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       return '';
     }
   }
+
+  private async ensuerUser(ctx: Context): Promise<{id: bigint }> {
+    const from = ctx.from;
+    if (!from) throw new Error('No user info in context');
+
+    const username = from.username || null;
+    const firstName = from.first_name || null;
+    const lastName = from.last_name || null;
+
+    const user = await this.prisma.user.upsert({
+      where: { id: BigInt(from.id) },
+      update: {
+        username,
+        firstName,
+        lastName,
+      },
+      create: {
+        id: BigInt(from.id), // используем строку как ID
+        username,
+        firstName,
+        lastName,
+      },
+    });
+
+    return { id: user.id };
+  }
+
 }
