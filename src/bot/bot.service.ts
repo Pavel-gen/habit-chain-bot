@@ -58,7 +58,8 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
       try {
         const aiResponse = await this.callOpenRouter(userMessage);
-        await this.sendLongMessage(ctx, aiResponse, user.id);
+        this.logger.log("Ответ модели: ", aiResponse);
+        await this.sendLongMessage(ctx, aiResponse.text, user.id);
       } catch (error) {
         this.logger.error('Ошибка при вызове OpenRouter:', error);
         await ctx.reply(
@@ -129,44 +130,59 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private async callOpenRouter(userMessage: string): Promise<string> {
-    const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-    if (!OPENROUTER_API_KEY) {
-      throw new Error('OPENROUTER_API_KEY is not defined in .env');
-    }
-
-    // 🔁 Твой фиксированный промпт
-    try {
-      const response = await axios.post(
-        'https://openrouter.ai/api/v1/chat/completions',
-        {
-          model: 'nex-agi/deepseek-v3.1-nex-n1', // или любой другой бесплатный/платный
-          messages: [
-            { role: 'system', content: this.SYSTEM_PROMPT },
-            { role: 'user', content: userMessage },
-          ],
-          max_tokens: 1000,
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-            'HTTP-Referer': 'http://localhost', // обязательно для OpenRouter
-            'X-Title': 'My Telegram AI Bot',
-            'Content-Type': 'application/json',
-          },
-        },
-      );
-
-      const aiText = response.data.choices[0]?.message?.content?.trim();
-      if (!aiText) {
-        throw new Error('Пустой ответ от OpenRouter');
-      }
-      return aiText;
-    } catch (err) {
-      this.logger.error(`Ошибка при запросе ${err.message}`);
-      return '';
-    }
+private async callOpenRouter(userMessage: string): Promise<{ text: string; raw: string }> {
+  const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+  if (!OPENROUTER_API_KEY) {
+    throw new Error('OPENROUTER_API_KEY is not defined in .env');
   }
+
+  try {
+    const response = await axios.post(
+      'https://openrouter.ai/api/v1/chat/completions',
+      {
+        model: 'nex-agi/deepseek-v3.1-nex-n1',
+        messages: [
+          { role: 'system', content: this.SYSTEM_PROMPT },
+          { role: 'user', content: userMessage },
+        ],
+        max_tokens: 1000,
+        // 👇 Добавь это, если OpenRouter поддерживает (усиливает JSON-гарантию)
+        // response_format: { type: 'json_object' },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+          'HTTP-Referer': 'http://localhost',
+          'X-Title': 'My Telegram AI Bot',
+          'Content-Type': 'application/json',
+        },
+      },
+    );
+
+    const aiText = response.data.choices[0]?.message?.content?.trim();
+    if (!aiText) {
+      throw new Error('Пустой ответ от OpenRouter');
+    }
+
+    // Попытка распарсить как JSON
+    try {
+      const parsed = JSON.parse(aiText);
+      // Проверим, что есть хотя бы поле `text`
+      if (typeof parsed.text === 'string') {
+        return { text: parsed.text, raw: aiText };
+      } else {
+        // JSON есть, но нет `text` — вернём как есть
+        return { text: aiText, raw: aiText };
+      }
+    } catch (parseError) {
+      // Не JSON — вернём как обычный текст
+      return { text: aiText, raw: aiText };
+    }
+  } catch (err) {
+    this.logger.error(`Ошибка при запросе: ${err.message}`);
+    throw new Error('Не удалось получить ответ от ИИ');
+  }
+}
 
   private async ensuerUser(ctx: Context): Promise<{id: bigint }> {
     const from = ctx.from;
