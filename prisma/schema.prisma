@@ -14,21 +14,23 @@ datasource db {
 }
 
 model User {
-  id         BigInt   @id
-  username   String? 
-  firstName  String? 
-  lastName   String?
-  createdAt  DateTime @default(now())
-  messages   Message[]
+  id           BigInt        @id
+  username     String?
+  firstName    String?
+  lastName     String?
+  createdAt    DateTime      @default(now())
+  messages     Message[]
+  interactions Interaction[] // ← новое
 }
 
 model Message {
-  id        String @id @default(uuid())
-  content   String
-  sender    Sender
-  userId    BigInt 
-  user      User   @relation(fields: [userId], references: [id])
-  createdAt DateTime @default(now())
+  id          String       @id @default(uuid())
+  content     String
+  sender      Sender
+  userId      BigInt
+  user        User         @relation(fields: [userId], references: [id])
+  createdAt   DateTime     @default(now())
+  interaction Interaction?
 
   @@index([userId])
 }
@@ -36,4 +38,42 @@ model Message {
 enum Sender {
   bot
   user
+}
+
+// Новая сущность — структурированный анализ
+model Interaction {
+  id     String @id @default(uuid())
+  userId BigInt
+  user   User   @relation(fields: [userId], references: [id])
+
+  // Ссылка на исходное сообщение пользователя (опционально, но полезно)
+  userMessageId String?  @unique
+  userMessage   Message? @relation(fields: [userMessageId], references: [id])
+
+  // Цепь событий
+  trigger          String
+  thought          String
+  emotionName      String
+  emotionIntensity Int
+  action           String
+  consequence      String
+
+  // Паттерны (можно хранить как JSON или через связь Many-to-Many)
+  patterns Json // ← простой и гибкий вариант
+
+  // Анализ
+  goal                  String
+  ineffectivenessReason String
+  hiddenNeed            String
+
+  // Альтернативы
+  alternatives Json // массив строк
+
+  // Сырой JSON (для отладки или будущего парсинга)
+  rawResponse String
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([createdAt])
 }
