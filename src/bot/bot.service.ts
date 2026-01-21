@@ -8,9 +8,16 @@ import { message } from 'telegraf/filters';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { timeStamp } from 'console';
 
+interface MySession {
+  postAnalysisMode?: boolean;
+  lastAnalysisReport?: string;
+}
+
+type MyContext = Context & { session: MySession };
+
 @Injectable()
 export class BotService implements OnModuleInit, OnModuleDestroy {
-  private bot: Telegraf<Context>;
+  private bot: Telegraf<MyContext>;
   private logger = new Logger(BotService.name);
   private SYSTEM_PROMPT: string;
 
@@ -42,79 +49,47 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       );
     });
 
-    this.bot.command('analyze', async (ctx) => {
+    this.bot.command('analyze', async (ctx: MyContext) => {
       const user = await this.ensuerUser(ctx);
-      await ctx.reply(
-        'Генерирую персональный отчёт по вашим последним взаимодействиям...',
-      );
+
+      if (!ctx.session) {
+        ctx.session = {};
+      }
+
+      await ctx.reply('Генерирую персональный отчёт...');
 
       try {
         const report = await this.generateBehaviorReport(user.id);
-        await ctx.reply(report, { parse_mode: 'Markdown' }); // можно без Markdown
+        await this.sendLongMessage(ctx, report, user.id);
+
+        ctx.session.postAnalysisMode = true;
+        ctx.session.lastAnalysisReport = report;
       } catch (error) {
-        this.logger.error('Ошибка генерации отчёта:', error);
-        await ctx.reply('❌ Не удалось создать отчёт. Попробуйте позже.');
+        this.logger.error('Ошибка генерации отчёта:', error.message);
+        await ctx.reply('❌ Не удалось создать отчёт.');
       }
     });
 
-    // Обработка всех текстовых сообщений
-    this.bot.on(message('text'), async (ctx) => {
-      const user = await this.ensuerUser(ctx);
-      const userMessageText = ctx.message.text;
+    this.bot.command('done', async (ctx: MyContext) => {
+      ctx.session.postAnalysisMode = false;
+      delete ctx.session.lastAnalysisReport;
+      await ctx.reply(
+        '✅ Вернулись в обычный режим. Присылайте новую ситуацию.',
+      );
+    });
 
-      const userMessage = await this.prisma.message.create({
-        data: {
-          content: userMessageText,
-          sender: 'user',
-          userId: user.id,
-        },
-      });
+    // === Основной обработчик текста ===
+    this.bot.on(message('text'), async (ctx: MyContext) => {
+      // 👇 Это утверждение типа: мы знаем, что message — текстовое
+      const msg = ctx.message;
+      if (!msg || !('text' in msg)) return; // защита (хотя фильтр уже гарантирует это)
 
-      try {
-        // 2. Получаем ответ от ИИ
-        const aiResponse = await this.callOpenRouter(userMessageText);
-        this.logger.log('Ответ модели:', aiResponse);
+      const userText = msg.text;
 
-        // 3. Парсим структурированный анализ
-        let parsed;
-        try {
-          parsed = JSON.parse(aiResponse.raw);
-        } catch (e) {
-          this.logger.error(
-            'Не удалось распарсить raw-ответ как JSON:',
-            aiResponse.raw,
-          );
-          throw new Error('Некорректный формат ответа от ИИ');
-        }
-
-        // 4. Сохраняем Interaction
-        await this.prisma.interaction.create({
-          data: {
-            userId: user.id,
-            userMessageId: userMessage.id, // ← привязка к исходному сообщению
-            trigger: parsed.chain.trigger,
-            thought: parsed.chain.thought,
-            emotionName: parsed.chain.emotion.name,
-            emotionIntensity: parsed.chain.emotion.intensity,
-            action: parsed.chain.action,
-            consequence: parsed.chain.consequence,
-            patterns: parsed.patterns, // Prisma автоматически сериализует в JSON
-            goal: parsed.analysis.goal,
-            ineffectivenessReason: parsed.analysis.ineffectiveness_reason,
-            hiddenNeed: parsed.analysis.hidden_need,
-            alternatives: parsed.alternatives,
-            rawResponse: aiResponse.raw,
-          },
-        });
-
-        // 5. Отправляем и сохраняем ответ бота
-        await this.sendLongMessage(ctx, aiResponse.text, user.id);
-      } catch (error) {
-        this.logger.error('Ошибка при обработке запроса:', error);
-        await ctx.reply(
-          '⚠️ Произошла ошибка при обработке запроса. Попробуйте позже.',
-        );
+      if (ctx.session?.postAnalysisMode) {
+        return this.handlePostAnalysisMessage(ctx, userText);
       }
+      return this.handleRegularMessage(ctx, userText);
     });
 
     // Запуск бота
@@ -131,7 +106,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     await this.bot.stop('SIGTERM');
   }
 
-  private async sendLongMessage(ctx: Context, text: string, userId: bigint) {
+  private async sendLongMessage(ctx: MyContext, text: string, userId: bigint) {
     const MAX_LENGTH = 4096;
     if (text.length <= MAX_LENGTH) {
       await ctx.reply(text);
@@ -231,7 +206,132 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private async ensuerUser(ctx: Context): Promise<{ id: bigint }> {
+  private async handlePostAnalysisMessage(ctx: MyContext, userText: string) {
+    const user = await this.ensuerUser(ctx);
+    const text = userText.trim();
+
+    // Сохраняем сообщение
+    await this.prisma.message.create({
+      data: { content: text, sender: 'user', userId: user.id },
+    });
+
+    // Проверка на выход
+    const exitWords = ['стоп', 'хватит', 'всё', 'спасибо', 'готово', 'конец'];
+    if (exitWords.some((word) => text.toLowerCase().includes(word))) {
+      ctx.session.postAnalysisMode = false;
+      delete ctx.session.lastAnalysisReport;
+      await ctx.reply(
+        'Режим анализа завершён. Можете прислать новую ситуацию.',
+      );
+      return;
+    }
+
+    // Генерация ответа с контекстом отчёта
+    const lastReport = ctx.session.lastAnalysisReport || '';
+    const qaPrompt = `
+Ты — терапевт. Пользователь получил следующий анализ:
+
+---
+${lastReport}
+---
+
+Он пишет:
+«${text}»
+
+Дай **чёткий, содержательный ответ**, основанный на этом анализе.
+- Не повторяй отчёт.
+- Ответь по существу.
+- Если вопрос эмоциональный — свяжи с паттерном.
+- Максимум 3–4 предложения. Прямо. Без жаргона.
+`.trim();
+
+    try {
+      const response = await axios.post(
+        'https://openrouter.ai/api/v1/chat/completions',
+        {
+          model: 'deepseek/deepseek-v3.2',
+          messages: [{ role: 'user', content: qaPrompt }],
+          max_tokens: 300,
+          temperature: 0.7,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+            'Content-Type': 'application/json',
+          },
+        },
+      );
+
+      const aiText =
+        response.data.choices[0]?.message?.content?.trim() || '...';
+
+      await this.sendLongMessage(ctx, aiText, user.id);
+
+      // Сохраняем ответ бота
+      await this.prisma.message.create({
+        data: { content: aiText, sender: 'bot', userId: user.id },
+      });
+    } catch (error) {
+      this.logger.error('Ошибка в post-analysis режиме:', error.message);
+      await ctx.reply('Не могу ответить сейчас. Но я здесь.');
+    }
+  }
+
+  // === Обычный режим: разбор новой ситуации ===
+  private async handleRegularMessage(ctx: MyContext, userText: string) {
+    const user = await this.ensuerUser(ctx);
+    const userMessageText = userText.trim();
+
+    const userMessage = await this.prisma.message.create({
+      data: {
+        content: userMessageText,
+        sender: 'user',
+        userId: user.id,
+      },
+    });
+
+    try {
+      const aiResponse = await this.callOpenRouter(userMessageText);
+      this.logger.log('Ответ модели:', aiResponse.raw);
+
+      let parsed;
+      try {
+        parsed = JSON.parse(aiResponse.raw);
+      } catch (e) {
+        this.logger.error(
+          'Не удалось распарсить raw-ответ как JSON:',
+          aiResponse.raw,
+        );
+        throw new Error('Некорректный формат ответа от ИИ');
+      }
+
+      await this.prisma.interaction.create({
+        data: {
+          userId: user.id,
+          userMessageId: userMessage.id,
+          trigger: parsed.chain.trigger,
+          thought: parsed.chain.thought,
+          emotionName: parsed.chain.emotion.name,
+          emotionIntensity: parsed.chain.emotion.intensity,
+          action: parsed.chain.action,
+          consequence: parsed.chain.consequence,
+          patterns: parsed.patterns,
+          goal: parsed.analysis.goal,
+          ineffectivenessReason: parsed.analysis.ineffectiveness_reason,
+          hiddenNeed: parsed.analysis.hidden_need,
+          alternatives: parsed.alternatives,
+          rawResponse: aiResponse.raw,
+        },
+      });
+
+      await this.sendLongMessage(ctx, aiResponse.text, user.id);
+    } catch (error) {
+      this.logger.error('Ошибка при обработке запроса:', error);
+      await ctx.reply('⚠️ Произошла ошибка. Попробуйте позже.');
+    }
+  }
+
+  private async ensuerUser(ctx: MyContext): Promise<{ id: bigint }> {
     const from = ctx.from;
     if (!from) throw new Error('No user info in context');
 
@@ -273,9 +373,22 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         const patterns = Array.isArray(i.patterns)
           ? i.patterns
           : JSON.parse(i.patterns as any);
-        return `[${i.createdAt.toLocaleDateString()}] Триггер: "${i.trigger}". Эмоция: ${i.emotionName} (${i.emotionIntensity}/10). Паттерны: ${patterns.join(', ')}. Последствие: "${i.consequence}"`;
+        const alternatives = Array.isArray(i.alternatives)
+          ? i.alternatives
+          : JSON.parse(i.alternatives as any);
+
+        return `[${i.createdAt.toLocaleDateString()}]
+            Цель: "${i.goal || 'не указана'}"
+            Триггер: "${i.trigger}"
+            Мысль: "${i.thought}"
+            Эмоция: ${i.emotionName} (${i.emotionIntensity}/10)
+            Действие: "${i.action}"
+            Последствие: "${i.consequence}"
+            Скрытая потребность: "${i.hiddenNeed || 'не распознана'}"
+            Паттерны: ${patterns.length > 0 ? patterns.join(', ') : '—'}
+            Альтернативы: ${alternatives.length > 0 ? alternatives.join('; ') : '—'}`;
       })
-      .join('\n');
+      .join('\n\n');
 
     const prompt = fs
       .readFileSync(
@@ -295,9 +408,9 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     const response = await axios.post(
       'https://openrouter.ai/api/v1/chat/completions',
       {
-        model: 'nex-agi/deepseek-v3.1-nex-n1', // ← лучше использовать gpt-4o-mini или claude — они точнее в анализе
+        model: 'deepseek/deepseek-v3.2', // ← лучше использовать gpt-4o-mini или claude — они точнее в анализе
         messages: [{ role: 'user', content: prompt }],
-        max_tokens: 500,
+        max_tokens: 1000,
       },
       {
         headers: {
