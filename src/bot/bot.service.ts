@@ -11,6 +11,7 @@ import { timeStamp } from 'console';
 interface MySession {
   postAnalysisMode?: boolean;
   lastAnalysisReport?: string;
+  coreMode?: boolean;
 }
 
 type MyContext = Context & { session: MySession };
@@ -70,28 +71,55 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       }
     });
 
-    this.bot.command('done', async (ctx: MyContext) => {
+    this.bot.command('core', async (ctx: MyContext) => {
+      const user = await this.ensuerUser(ctx);
+
+      if (!ctx.session) {
+        ctx.session = {};
+      }
+
+      // Выключаем другие режимы
       ctx.session.postAnalysisMode = false;
       delete ctx.session.lastAnalysisReport;
+
+      // Включаем core-режим
+      ctx.session.coreMode = true;
+
+      await ctx.reply('🧠 Включён Core Mode. Спроси у себя вопрос.');
+    });
+
+    this.bot.command('done', async (ctx: MyContext) => {
+      if (!ctx.session) {
+        ctx.session = {};
+      }
+
+      // Сбрасываем все специальные режимы
+      ctx.session.postAnalysisMode = false;
+      ctx.session.coreMode = false;
+      delete ctx.session.lastAnalysisReport;
+
       await ctx.reply(
         '✅ Вернулись в обычный режим. Присылайте новую ситуацию.',
       );
     });
-
     // === Основной обработчик текста ===
     this.bot.on(message('text'), async (ctx: MyContext) => {
-      // 👇 Это утверждение типа: мы знаем, что message — текстовое
       const msg = ctx.message;
-      if (!msg || !('text' in msg)) return; // защита (хотя фильтр уже гарантирует это)
+      if (!msg || !('text' in msg)) return;
 
       const userText = msg.text;
+
+      // Приоритет: сначала специальные режимы
+      if (ctx.session?.coreMode) {
+        return this.handleCoreModeMessage(ctx, userText);
+      }
 
       if (ctx.session?.postAnalysisMode) {
         return this.handlePostAnalysisMessage(ctx, userText);
       }
+
       return this.handleRegularMessage(ctx, userText);
     });
-
     // Запуск бота
     try {
       await this.bot.launch();
@@ -424,5 +452,73 @@ ${lastReport}
       response.data.choices[0]?.message?.content?.trim() ||
       'Не удалось сгенерировать отчёт.'
     );
+  }
+
+  private async handleCoreModeMessage(ctx: MyContext, userText: string) {
+    const user = await this.ensuerUser(ctx);
+    const text = userText.trim();
+
+    // Сохраняем сообщение пользователя
+    await this.prisma.message.create({
+      data: { content: text, sender: 'user', userId: user.id },
+    });
+
+    // Проверка на выход (опционально, но удобно)
+    const exitWords = ['/done'];
+    if (exitWords.some((word) => text.toLowerCase().includes(word))) {
+      ctx.session.coreMode = false;
+      await ctx.reply('Режим Core завершён. Можете прислать новую ситуацию.');
+      return;
+    }
+
+    // Загружаем промпт для core-режима
+    let CORE_PROMPT: string;
+    try {
+      const corePromptPath = path.join(
+        process.cwd(),
+        'src',
+        'llm',
+        'prompts',
+        'core_prompt.txt',
+      );
+      CORE_PROMPT = fs.readFileSync(corePromptPath, 'utf-8').trim();
+    } catch (err) {
+      this.logger.error('Не удалось загрузить core_prompt.txt:', err);
+      CORE_PROMPT = 'Ты — глубокий психолог. Проанализируй следующее:';
+    }
+
+    try {
+      const response = await axios.post(
+        'https://openrouter.ai/api/v1/chat/completions',
+        {
+          model: 'deepseek/deepseek-v3.2',
+          messages: [
+            { role: 'system', content: CORE_PROMPT },
+            { role: 'user', content: text },
+          ],
+          max_tokens: 1000,
+          temperature: 0.6,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+            'Content-Type': 'application/json',
+          },
+        },
+      );
+
+      const aiText =
+        response.data.choices[0]?.message?.content?.trim() || '...';
+
+      await this.sendLongMessage(ctx, aiText, user.id);
+
+      // Сохраняем ответ бота
+      await this.prisma.message.create({
+        data: { content: aiText, sender: 'bot', userId: user.id },
+      });
+    } catch (error) {
+      this.logger.error('Ошибка в core-режиме:', error.message);
+      await ctx.reply('Не могу ответить сейчас. Но я здесь.');
+    }
   }
 }
