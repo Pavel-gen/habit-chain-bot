@@ -497,7 +497,7 @@ ${lastReport}
             { role: 'user', content: text },
           ],
           max_tokens: 1000,
-          temperature: 0.6,
+          temperature: 0.95,
         },
         {
           headers: {
