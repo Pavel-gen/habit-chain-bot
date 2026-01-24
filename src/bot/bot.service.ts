@@ -44,14 +44,14 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
     // Команда /start
     this.bot.command('start', async (ctx) => {
-      await this.ensuerUser(ctx);
+      await this.ensureUser(ctx);
       await ctx.reply(
         'Привет! Отправь мне любое сообщение, и я обработаю его через ИИ.',
       );
     });
 
     this.bot.command('analyze', async (ctx: MyContext) => {
-      const user = await this.ensuerUser(ctx);
+      const user = await this.ensureUser(ctx);
 
       if (!ctx.session) {
         ctx.session = {};
@@ -72,7 +72,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     });
 
     this.bot.command('core', async (ctx: MyContext) => {
-      const user = await this.ensuerUser(ctx);
+      const user = await this.ensureUser(ctx);
 
       if (!ctx.session) {
         ctx.session = {};
@@ -136,16 +136,10 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
   private async sendLongMessage(ctx: MyContext, text: string, userId: bigint) {
     const MAX_LENGTH = 4096;
+
     if (text.length <= MAX_LENGTH) {
       await ctx.reply(text);
-
-      await this.prisma.message.create({
-        data: {
-          content: text,
-          sender: 'bot',
-          userId,
-        },
-      });
+      await this.saveMessage(userId, text, 'bot'); // ← универсальная функция
       return;
     }
 
@@ -154,7 +148,6 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     while (start < text.length) {
       let end = start + MAX_LENGTH;
 
-      // Если не последняя часть — пытаемся найти ближайший перенос строки или пробел
       if (end < text.length) {
         const lastNewline = text.lastIndexOf('\n', end);
         const lastSpace = text.lastIndexOf(' ', end);
@@ -166,85 +159,26 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
       const chunk = text.slice(start, end).trim();
       await ctx.reply(chunk);
-
-      await this.prisma.message.create({
-        data: {
-          content: chunk,
-          sender: 'bot',
-          userId,
-        },
-      });
+      await this.saveMessage(userId, chunk, 'bot'); // ← универсальная функция
       start = end;
     }
   }
 
-  private async callOpenRouter(
-    userMessage: string,
-  ): Promise<{ text: string; raw: string }> {
-    const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-    if (!OPENROUTER_API_KEY) {
-      throw new Error('OPENROUTER_API_KEY is not defined in .env');
-    }
-
-    try {
-      const response = await axios.post(
-        'https://openrouter.ai/api/v1/chat/completions',
-        {
-          model: 'nex-agi/deepseek-v3.1-nex-n1',
-          messages: [
-            { role: 'system', content: this.SYSTEM_PROMPT },
-            { role: 'user', content: userMessage },
-          ],
-          max_tokens: 1000,
-          // 👇 Добавь это, если OpenRouter поддерживает (усиливает JSON-гарантию)
-          // response_format: { type: 'json_object' },
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-            'HTTP-Referer': 'http://localhost',
-            'X-Title': 'My Telegram AI Bot',
-            'Content-Type': 'application/json',
-          },
-        },
-      );
-
-      const aiText = response.data.choices[0]?.message?.content?.trim();
-      if (!aiText) {
-        throw new Error('Пустой ответ от OpenRouter');
-      }
-
-      // Попытка распарсить как JSON
-      try {
-        const parsed = JSON.parse(aiText);
-        // Проверим, что есть хотя бы поле `text`
-        if (typeof parsed.text === 'string') {
-          return { text: parsed.text, raw: aiText };
-        } else {
-          // JSON есть, но нет `text` — вернём как есть
-          return { text: aiText, raw: aiText };
-        }
-      } catch (parseError) {
-        // Не JSON — вернём как обычный текст
-        return { text: aiText, raw: aiText };
-      }
-    } catch (err) {
-      this.logger.error(`Ошибка при запросе: ${err.message}`);
-      throw new Error('Не удалось получить ответ от ИИ');
-    }
-  }
-
   private async handlePostAnalysisMessage(ctx: MyContext, userText: string) {
-    const user = await this.ensuerUser(ctx);
+    const user = await this.ensureUser(ctx);
     const text = userText.trim();
 
-    // Сохраняем сообщение
-    await this.prisma.message.create({
-      data: { content: text, sender: 'user', userId: user.id },
-    });
+    await this.saveMessage(user.id, text, 'user');
 
-    // Проверка на выход
-    const exitWords = ['стоп', 'хватит', 'всё', 'спасибо', 'готово', 'конец'];
+    const exitWords = [
+      'стоп',
+      'хватит',
+      'всё',
+      'спасибо',
+      'готово',
+      'конец',
+      '/done',
+    ];
     if (exitWords.some((word) => text.toLowerCase().includes(word))) {
       ctx.session.postAnalysisMode = false;
       delete ctx.session.lastAnalysisReport;
@@ -254,7 +188,6 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    // Генерация ответа с контекстом отчёта
     const lastReport = ctx.session.lastAnalysisReport || '';
     const qaPrompt = `
 Ты — терапевт. Пользователь получил следующий анализ:
@@ -274,31 +207,13 @@ ${lastReport}
 `.trim();
 
     try {
-      const response = await axios.post(
-        'https://openrouter.ai/api/v1/chat/completions',
-        {
-          model: 'deepseek/deepseek-v3.2',
-          messages: [{ role: 'user', content: qaPrompt }],
-          max_tokens: 300,
-          temperature: 0.7,
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-            'Content-Type': 'application/json',
-          },
-        },
+      const aiText = await this.callLLM(
+        [{ role: 'user', content: qaPrompt }],
+        300,
+        0.7,
       );
-
-      const aiText =
-        response.data.choices[0]?.message?.content?.trim() || '...';
-
       await this.sendLongMessage(ctx, aiText, user.id);
-
-      // Сохраняем ответ бота
-      await this.prisma.message.create({
-        data: { content: aiText, sender: 'bot', userId: user.id },
-      });
+      await this.saveMessage(user.id, aiText, 'bot');
     } catch (error) {
       this.logger.error('Ошибка в post-analysis режиме:', error.message);
       await ctx.reply('Не могу ответить сейчас. Но я здесь.');
@@ -307,59 +222,87 @@ ${lastReport}
 
   // === Обычный режим: разбор новой ситуации ===
   private async handleRegularMessage(ctx: MyContext, userText: string) {
-    const user = await this.ensuerUser(ctx);
+    const user = await this.ensureUser(ctx);
     const userMessageText = userText.trim();
 
-    const userMessage = await this.prisma.message.create({
-      data: {
-        content: userMessageText,
-        sender: 'user',
-        userId: user.id,
-      },
-    });
+    // Сохраняем сообщение пользователя
+    await this.saveMessage(user.id, userMessageText, 'user');
 
     try {
-      const aiResponse = await this.callOpenRouter(userMessageText);
-      this.logger.log('Ответ модели:', aiResponse.raw);
+      // Загружаем основной промпт
+      const mainPromptPath = path.join(
+        process.cwd(),
+        'src',
+        'llm',
+        'prompts',
+        'DBTpromt1.txt',
+      );
+      const SYSTEM_PROMPT = fs.readFileSync(mainPromptPath, 'utf-8').trim();
 
+      // Получаем raw-ответ от модели (ожидается JSON-строка)
+      const rawResponse = await this.callLLM(
+        [
+          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'user', content: userMessageText },
+        ],
+        1000,
+        0.95,
+      );
+
+      this.logger.log('Ответ модели (raw):', rawResponse);
+
+      // Парсим JSON
       let parsed;
       try {
-        parsed = JSON.parse(aiResponse.raw);
+        parsed = JSON.parse(rawResponse);
       } catch (e) {
         this.logger.error(
           'Не удалось распарсить raw-ответ как JSON:',
-          aiResponse.raw,
+          rawResponse,
         );
         throw new Error('Некорректный формат ответа от ИИ');
       }
 
+      // Извлекаем текст для отправки пользователю (например, из поля `text` или `response`)
+      // ← Уточните, откуда берётся `aiResponse.text` в вашем текущем коде.
+      // Предположим, что модель возвращает объект с полем `text`.
+      const aiText = parsed.text || rawResponse; // fallback на случай ошибки
+
+      // Сохраняем структурированный анализ
       await this.prisma.interaction.create({
         data: {
           userId: user.id,
-          userMessageId: userMessage.id,
-          trigger: parsed.chain.trigger,
-          thought: parsed.chain.thought,
-          emotionName: parsed.chain.emotion.name,
-          emotionIntensity: parsed.chain.emotion.intensity,
-          action: parsed.chain.action,
-          consequence: parsed.chain.consequence,
-          patterns: parsed.patterns,
-          goal: parsed.analysis.goal,
-          ineffectivenessReason: parsed.analysis.ineffectiveness_reason,
-          hiddenNeed: parsed.analysis.hidden_need,
-          alternatives: parsed.alternatives,
-          rawResponse: aiResponse.raw,
+          // Связываем с последним сообщением пользователя (можно уточнить логику)
+          userMessageId: (
+            await this.prisma.message.findFirst({
+              where: { userId: user.id, sender: 'user' },
+              orderBy: { createdAt: 'desc' },
+            })
+          )?.id,
+          trigger: parsed.chain?.trigger ?? '',
+          thought: parsed.chain?.thought ?? '',
+          emotionName: parsed.chain?.emotion?.name ?? '',
+          emotionIntensity: parsed.chain?.emotion?.intensity ?? 0,
+          action: parsed.chain?.action ?? '',
+          consequence: parsed.chain?.consequence ?? '',
+          patterns: parsed.patterns ?? [],
+          goal: parsed.analysis?.goal ?? '',
+          ineffectivenessReason: parsed.analysis?.ineffectiveness_reason ?? '',
+          hiddenNeed: parsed.analysis?.hidden_need ?? '',
+          alternatives: parsed.alternatives ?? [],
+          rawResponse,
         },
       });
 
-      await this.sendLongMessage(ctx, aiResponse.text, user.id);
+      // Отправляем и сохраняем ответ бота
+      await this.sendLongMessage(ctx, aiText, user.id);
     } catch (error) {
       this.logger.error('Ошибка при обработке запроса:', error);
       await ctx.reply('⚠️ Произошла ошибка. Попробуйте позже.');
     }
   }
 
-  private async ensuerUser(ctx: MyContext): Promise<{ id: bigint }> {
+  private async ensureUser(ctx: MyContext): Promise<{ id: bigint }> {
     const from = ctx.from;
     if (!from) throw new Error('No user info in context');
 
@@ -406,72 +349,46 @@ ${lastReport}
           : JSON.parse(i.alternatives as any);
 
         return `[${i.createdAt.toLocaleDateString()}]
-            Цель: "${i.goal || 'не указана'}"
-            Триггер: "${i.trigger}"
-            Мысль: "${i.thought}"
-            Эмоция: ${i.emotionName} (${i.emotionIntensity}/10)
-            Действие: "${i.action}"
-            Последствие: "${i.consequence}"
-            Скрытая потребность: "${i.hiddenNeed || 'не распознана'}"
-            Паттерны: ${patterns.length > 0 ? patterns.join(', ') : '—'}
-            Альтернативы: ${alternatives.length > 0 ? alternatives.join('; ') : '—'}`;
+Цель: "${i.goal || 'не указана'}"
+Триггер: "${i.trigger}"
+Мысль: "${i.thought}"
+Эмоция: ${i.emotionName} (${i.emotionIntensity}/10)
+Действие: "${i.action}"
+Последствие: "${i.consequence}"
+Скрытая потребность: "${i.hiddenNeed || 'не распознана'}"
+Паттерны: ${patterns.length > 0 ? patterns.join(', ') : '—'}
+Альтернативы: ${alternatives.length > 0 ? alternatives.join('; ') : '—'}`;
       })
       .join('\n\n');
 
-    const prompt = fs
-      .readFileSync(
-        path.join(
-          process.cwd(),
-          'src',
-          'llm',
-          'prompts',
-          'BehaviorAnalysisPrompt.txt',
-        ),
-        'utf-8',
-      )
-      .replace('{{HISTORY}}', historyText);
-
-    this.logger.log('PROMT', prompt);
-
-    const response = await axios.post(
-      'https://openrouter.ai/api/v1/chat/completions',
-      {
-        model: 'deepseek/deepseek-v3.2', // ← лучше использовать gpt-4o-mini или claude — они точнее в анализе
-        messages: [{ role: 'user', content: prompt }],
-        max_tokens: 1000,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-      },
+    const promptTemplate = fs.readFileSync(
+      path.join(
+        process.cwd(),
+        'src',
+        'llm',
+        'prompts',
+        'BehaviorAnalysisPrompt.txt',
+      ),
+      'utf-8',
     );
+    const prompt = promptTemplate.replace('{{HISTORY}}', historyText);
 
-    return (
-      response.data.choices[0]?.message?.content?.trim() ||
-      'Не удалось сгенерировать отчёт.'
-    );
+    return await this.callLLM([{ role: 'user', content: prompt }], 1000, 0.7);
   }
 
   private async handleCoreModeMessage(ctx: MyContext, userText: string) {
-    const user = await this.ensuerUser(ctx);
+    const user = await this.ensureUser(ctx); // ← исправил опечатку: ensuer → ensure
     const text = userText.trim();
 
     // Сохраняем сообщение пользователя
-    await this.prisma.message.create({
-      data: { content: text, sender: 'user', userId: user.id },
-    });
+    await this.saveMessage(user.id, text, 'user');
 
-    // Проверка на выход (опционально, но удобно)
-    const exitWords = ['/done'];
-    if (exitWords.some((word) => text.toLowerCase().includes(word))) {
+    if (['/done'].some((word) => text.toLowerCase().includes(word))) {
       ctx.session.coreMode = false;
       await ctx.reply('Режим Core завершён. Можете прислать новую ситуацию.');
       return;
     }
 
-    // Загружаем промпт для core-режима
     let CORE_PROMPT: string;
     try {
       const corePromptPath = path.join(
@@ -488,16 +405,61 @@ ${lastReport}
     }
 
     try {
+      const aiText = await this.callLLM(
+        [
+          { role: 'system', content: CORE_PROMPT },
+          { role: 'user', content: text },
+        ],
+        1000,
+        0.95,
+      );
+
+      await this.sendLongMessage(ctx, aiText, user.id);
+      await this.saveMessage(user.id, aiText, 'bot'); // ← единая точка сохранения
+    } catch (error) {
+      this.logger.error('Ошибка в core-режиме:', error.message);
+      await ctx.reply('Не могу ответить сейчас. Но я здесь.');
+    }
+  }
+
+  private async saveMessage(
+    userId: bigint,
+    content: string,
+    sender: 'user' | 'bot',
+  ): Promise<void> {
+    const message = await this.prisma.message.create({
+      data: {
+        content,
+        sender, // ← enum значения должны совпадать с Prisma-схемой (у вас 'user'/'bot')
+        userId,
+      },
+    });
+
+    if (sender === 'user') {
+      // Запускаем асинхронно, чтобы не блокировать ответ пользователю
+      setImmediate(() => {
+        this.createJournalEntryFromMessage(userId, message.id, content).catch(
+          () => {
+            /* ошибки уже залогированы внутри */
+          },
+        );
+      });
+    }
+  }
+
+  private async callLLM(
+    messages: { role: 'system' | 'user' | 'assistant'; content: string }[],
+    maxTokens: number = 1000,
+    temperature: number = 0.95,
+  ): Promise<string> {
+    try {
       const response = await axios.post(
         'https://openrouter.ai/api/v1/chat/completions',
         {
           model: 'deepseek/deepseek-v3.2',
-          messages: [
-            { role: 'system', content: CORE_PROMPT },
-            { role: 'user', content: text },
-          ],
-          max_tokens: 1000,
-          temperature: 0.95,
+          messages,
+          max_tokens: maxTokens,
+          temperature,
         },
         {
           headers: {
@@ -507,18 +469,76 @@ ${lastReport}
         },
       );
 
-      const aiText =
-        response.data.choices[0]?.message?.content?.trim() || '...';
-
-      await this.sendLongMessage(ctx, aiText, user.id);
-
-      // Сохраняем ответ бота
-      await this.prisma.message.create({
-        data: { content: aiText, sender: 'bot', userId: user.id },
-      });
+      return response.data.choices[0]?.message?.content?.trim() || '...';
     } catch (error) {
-      this.logger.error('Ошибка в core-режиме:', error.message);
-      await ctx.reply('Не могу ответить сейчас. Но я здесь.');
+      this.logger.error('Ошибка вызова LLM:', error.message || error);
+      throw new Error('Не удалось получить ответ от модели.');
+    }
+  }
+
+  private async createJournalEntryFromMessage(
+    userId: bigint,
+    messageId: string,
+    messageText: string,
+  ): Promise<void> {
+    // Пропускаем пустые или технические сообщения
+    const trimmed = messageText.trim();
+    if (!trimmed || /\/\w+|спасибо|стоп|готово|хватит|конец/i.test(trimmed)) {
+      return;
+    }
+
+    try {
+      // Загружаем промпт
+      const promptTemplate = fs.readFileSync(
+        path.join(
+          process.cwd(),
+          'src',
+          'llm',
+          'prompts',
+          'message_to_journal.txt',
+        ),
+        'utf-8',
+      );
+      const prompt = promptTemplate.replace('{{MESSAGE}}', trimmed);
+
+      // Вызываем LLM
+      const rawResponse = await this.callLLM(
+        [{ role: 'user', content: prompt }],
+        500,
+        0.3,
+      );
+
+      // Парсим JSON
+      let parsed;
+      try {
+        parsed = JSON.parse(rawResponse);
+      } catch (e) {
+        this.logger.warn('Не удалось распарсить journal entry:', rawResponse);
+        return; // молча игнорируем, если не JSON
+      }
+
+      // Проверяем, что это не null и содержит нужные поля
+      if (!parsed || !parsed.content || !parsed.type) {
+        return;
+      }
+
+      // Сохраняем запись
+      await this.prisma.journalEntry.create({
+        data: {
+          userId,
+          sourceMessageId: messageId,
+          type: parsed.type,
+          content: parsed.content.trim(),
+          description: parsed.description?.trim() || null,
+        },
+      });
+
+      this.logger.debug(
+        `Создана запись журнала для userId=${userId}: ${parsed.content}`,
+      );
+    } catch (error) {
+      this.logger.error('Ошибка при создании JournalEntry:', error.message);
+      // Не прерываем основной поток — просто логируем
     }
   }
 }

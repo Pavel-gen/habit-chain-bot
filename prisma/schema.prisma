@@ -14,23 +14,25 @@ datasource db {
 }
 
 model User {
-  id           BigInt        @id
+  id           BigInt         @id
   username     String?
   firstName    String?
   lastName     String?
-  createdAt    DateTime      @default(now())
+  createdAt    DateTime       @default(now())
   messages     Message[]
   interactions Interaction[] // ← новое
+  JournalEntry JournalEntry[]
 }
 
 model Message {
-  id          String       @id @default(uuid())
-  content     String
-  sender      Sender
-  userId      BigInt
-  user        User         @relation(fields: [userId], references: [id])
-  createdAt   DateTime     @default(now())
-  interaction Interaction?
+  id           String         @id @default(uuid())
+  content      String
+  sender       Sender
+  userId       BigInt
+  user         User           @relation(fields: [userId], references: [id])
+  createdAt    DateTime       @default(now())
+  interaction  Interaction?
+  JournalEntry JournalEntry[]
 
   @@index([userId])
 }
@@ -76,4 +78,33 @@ model Interaction {
 
   @@index([userId])
   @@index([createdAt])
+}
+
+model JournalEntry {
+  id     String @id @default(uuid())
+  userId BigInt
+  user   User   @relation(fields: [userId], references: [id])
+
+  type        JournalEntryType @default(INSIGHT)
+  content     String // Краткая формулировка (обязательная)
+  description String? // Подробности (опционально)
+
+  sourceMessageId String?
+  sourceMessage   Message? @relation(fields: [sourceMessageId], references: [id])
+
+  createdAt  DateTime @default(now())
+  confidence Float? // 0.0–1.0, если нужно
+
+  @@index([userId])
+  @@index([type])
+}
+
+enum JournalEntryType {
+  INSIGHT
+  PATTERN
+  EMOTIONAL_STATE
+  SELF_ASSESSMENT
+  VALUE
+  BELIEF
+  GOAL
 }
