@@ -7,6 +7,7 @@ import * as path from 'path';
 import { message } from 'telegraf/filters';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { timeStamp } from 'console';
+import cron from 'node-cron';
 
 interface MySession {
   postAnalysisMode?: boolean;
@@ -40,6 +41,8 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       'prompts',
       'DBTpromt1.txt',
     );
+    this.startStateCheckCron();
+
     this.SYSTEM_PROMPT = fs.readFileSync(promptPath, 'utf-8').trim();
 
     // Команда /start
@@ -130,6 +133,52 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  private startStateCheckCron() {
+    // Запуск каждые 4 часа
+    cron.schedule('0 9-23/3 * * *', async () => {
+      try {
+        await this.sendStateCheckToAllActiveUsers();
+      } catch (error) {
+        this.logger.error(
+          'Ошибка в крон-задаче sendStateCheckToAllActiveUsers:',
+          error,
+        );
+      }
+    });
+    this.logger.log('Запланирована крон-задача: опрос состояния каждые 4 часа');
+  }
+
+  private async sendStateCheckToAllActiveUsers() {
+    const activeUsers = await this.prisma.user.findMany({
+      where: {
+        messages: {
+          some: {
+            createdAt: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
+          },
+        },
+      },
+      select: { id: true }, // ← только id, который и есть telegramId
+    });
+
+    for (const user of activeUsers) {
+      try {
+        // user.id — это BigInt, но Telegram Bot API принимает number или string
+        // В JS/TS number безопасен до 2^53, а Telegram ID < 2^53, так что можно привести к number
+        const chatId = Number(user.id);
+
+        await this.bot.telegram.sendMessage(
+          chatId,
+          '🧠 Как ты прямо сейчас?\n(Можно коротко: «устал», «радуюсь», «голоден», «раздражён» и т.д.)',
+        );
+      } catch (err) {
+        this.logger.warn(
+          `Не удалось отправить STATE_CHECK пользователю ${user.id}:`,
+          err.message,
+        );
+      }
+    }
+  }
+
   async onModuleDestroy() {
     await this.bot.stop('SIGTERM');
   }
@@ -213,7 +262,6 @@ ${lastReport}
         0.7,
       );
       await this.sendLongMessage(ctx, aiText, user.id);
-      await this.saveMessage(user.id, aiText, 'bot');
     } catch (error) {
       this.logger.error('Ошибка в post-analysis режиме:', error.message);
       await ctx.reply('Не могу ответить сейчас. Но я здесь.');
@@ -227,6 +275,12 @@ ${lastReport}
 
     // Сохраняем сообщение пользователя
     await this.saveMessage(user.id, userMessageText, 'user');
+
+    // 🔹 Проверка: если это похоже на STATE_CHECK — не анализируем
+    if (this.isStateCheckMessage(userMessageText)) {
+      await ctx.reply('Спасибо, записал ✍️');
+      return;
+    }
 
     try {
       // Загружаем основной промпт
@@ -302,6 +356,25 @@ ${lastReport}
     }
   }
 
+  private isStateCheckMessage(text: string): boolean {
+    const trimmed = text.trim();
+    // Слишком длинное — не STATE_CHECK
+    if (trimmed.length > 70) return false;
+
+    // Содержит сложные конструкции? (признак анализа ситуации)
+    if (
+      trimmed.includes('потому что') ||
+      trimmed.includes('когда') ||
+      trimmed.includes('после того')
+    ) {
+      return false;
+    }
+
+    // Слишком короткое или простое — вероятно, состояние
+    const words = trimmed.split(/\s+/).length;
+    return words <= 5; // максимум 5 слов
+  }
+
   private async ensureUser(ctx: MyContext): Promise<{ id: bigint }> {
     const from = ctx.from;
     if (!from) throw new Error('No user info in context');
@@ -339,27 +412,9 @@ ${lastReport}
       return 'У вас пока нет сохранённых разборов. Напишите боту ситуацию, чтобы начать анализ.';
     }
 
-    const historyText = interactions
-      .map((i) => {
-        const patterns = Array.isArray(i.patterns)
-          ? i.patterns
-          : JSON.parse(i.patterns as any);
-        const alternatives = Array.isArray(i.alternatives)
-          ? i.alternatives
-          : JSON.parse(i.alternatives as any);
-
-        return `[${i.createdAt.toLocaleDateString()}]
-Цель: "${i.goal || 'не указана'}"
-Триггер: "${i.trigger}"
-Мысль: "${i.thought}"
-Эмоция: ${i.emotionName} (${i.emotionIntensity}/10)
-Действие: "${i.action}"
-Последствие: "${i.consequence}"
-Скрытая потребность: "${i.hiddenNeed || 'не распознана'}"
-Паттерны: ${patterns.length > 0 ? patterns.join(', ') : '—'}
-Альтернативы: ${alternatives.length > 0 ? alternatives.join('; ') : '—'}`;
-      })
-      .join('\n\n');
+    const historyText = this.formatInteractions(interactions);
+    const messagesText = await this.getRecentUserMessages(userId, 5);
+    const journalText = await this.getJournalEntriesText(userId, 20);
 
     const promptTemplate = fs.readFileSync(
       path.join(
@@ -371,16 +426,19 @@ ${lastReport}
       ),
       'utf-8',
     );
-    const prompt = promptTemplate.replace('{{HISTORY}}', historyText);
 
-    return await this.callLLM([{ role: 'user', content: prompt }], 1000, 0.7);
+    const prompt = promptTemplate
+      .replace('{{RECENT_MESSAGES}}', messagesText)
+      .replace('{{JOURNAL_ENTRIES}}', journalText)
+      .replace('{{HISTORY}}', historyText);
+
+    return await this.callLLM([{ role: 'user', content: prompt }], 1000, 0.9);
   }
 
   private async handleCoreModeMessage(ctx: MyContext, userText: string) {
-    const user = await this.ensureUser(ctx); // ← исправил опечатку: ensuer → ensure
+    const user = await this.ensureUser(ctx);
     const text = userText.trim();
 
-    // Сохраняем сообщение пользователя
     await this.saveMessage(user.id, text, 'user');
 
     if (['/done'].some((word) => text.toLowerCase().includes(word))) {
@@ -389,7 +447,11 @@ ${lastReport}
       return;
     }
 
-    let CORE_PROMPT: string;
+    // Получаем контекст
+    const recentMessages = await this.getRecentUserMessages(user.id, 5);
+    const journalEntries = await this.getJournalEntriesText(user.id, 15); // чуть меньше, чтобы не перегружать
+
+    let CORE_PROMPT_TEMPLATE: string;
     try {
       const corePromptPath = path.join(
         process.cwd(),
@@ -398,16 +460,22 @@ ${lastReport}
         'prompts',
         'core_prompt.txt',
       );
-      CORE_PROMPT = fs.readFileSync(corePromptPath, 'utf-8').trim();
+      CORE_PROMPT_TEMPLATE = fs.readFileSync(corePromptPath, 'utf-8').trim();
     } catch (err) {
       this.logger.error('Не удалось загрузить core_prompt.txt:', err);
-      CORE_PROMPT = 'Ты — глубокий психолог. Проанализируй следующее:';
+      CORE_PROMPT_TEMPLATE = 'Ты — глубокий психолог. Проанализируй следующее:';
     }
+
+    // Подставляем контекст в шаблон
+    const fullSystemPrompt = CORE_PROMPT_TEMPLATE.replace(
+      '{{RECENT_MESSAGES}}',
+      recentMessages,
+    ).replace('{{JOURNAL_ENTRIES}}', journalEntries);
 
     try {
       const aiText = await this.callLLM(
         [
-          { role: 'system', content: CORE_PROMPT },
+          { role: 'system', content: fullSystemPrompt },
           { role: 'user', content: text },
         ],
         1000,
@@ -415,7 +483,6 @@ ${lastReport}
       );
 
       await this.sendLongMessage(ctx, aiText, user.id);
-      await this.saveMessage(user.id, aiText, 'bot'); // ← единая точка сохранения
     } catch (error) {
       this.logger.error('Ошибка в core-режиме:', error.message);
       await ctx.reply('Не могу ответить сейчас. Но я здесь.');
@@ -452,6 +519,8 @@ ${lastReport}
     maxTokens: number = 1000,
     temperature: number = 0.95,
   ): Promise<string> {
+    this.logger.log('messages', messages);
+
     try {
       const response = await axios.post(
         'https://openrouter.ai/api/v1/chat/completions',
@@ -540,5 +609,72 @@ ${lastReport}
       this.logger.error('Ошибка при создании JournalEntry:', error.message);
       // Не прерываем основной поток — просто логируем
     }
+  }
+
+  private async getRecentUserMessages(
+    userId: bigint,
+    limit = 5,
+  ): Promise<string> {
+    const messages = await this.prisma.message.findMany({
+      where: { userId, sender: 'user' },
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+      select: { content: true, createdAt: true },
+    });
+
+    if (messages.length === 0) return '— нет недавних сообщений';
+
+    return messages
+      .reverse()
+      .map((m) => `[${m.createdAt.toLocaleString()}] ${m.content}`)
+      .join('\n');
+  }
+
+  private async getJournalEntriesText(
+    userId: bigint,
+    limit = 20,
+  ): Promise<string> {
+    const entries = await this.prisma.journalEntry.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'asc' },
+      take: limit,
+      select: { type: true, content: true, description: true, createdAt: true },
+    });
+
+    if (entries.length === 0) return '— нет записей';
+
+    return entries
+      .map(
+        (j) =>
+          `[${j.createdAt.toLocaleDateString()}] [${j.type}] ${j.content}` +
+          (j.description ? `\n  → ${j.description}` : ''),
+      )
+      .join('\n');
+  }
+
+  private formatInteractions(interactions: any[]): string {
+    if (interactions.length === 0) return '';
+
+    return interactions
+      .map((i) => {
+        const patterns = Array.isArray(i.patterns)
+          ? i.patterns
+          : JSON.parse(i.patterns as any);
+        const alternatives = Array.isArray(i.alternatives)
+          ? i.alternatives
+          : JSON.parse(i.alternatives as any);
+
+        return `[${i.createdAt.toLocaleDateString()}]
+Цель: "${i.goal || 'не указана'}"
+Триггер: "${i.trigger}"
+Мысль: "${i.thought}"
+Эмоция: ${i.emotionName} (${i.emotionIntensity}/10)
+Действие: "${i.action}"
+Последствие: "${i.consequence}"
+Скрытая потребность: "${i.hiddenNeed || 'не распознана'}"
+Паттерны: ${patterns.length > 0 ? patterns.join(', ') : '—'}
+Альтернативы: ${alternatives.length > 0 ? alternatives.join('; ') : '—'}`;
+      })
+      .join('\n\n');
   }
 }
