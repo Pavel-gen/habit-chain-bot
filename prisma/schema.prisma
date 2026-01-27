@@ -22,6 +22,7 @@ model User {
   messages     Message[]
   interactions Interaction[] // ← новое
   JournalEntry JournalEntry[]
+  rules        Rule[]
 }
 
 model Message {
@@ -107,4 +108,20 @@ enum JournalEntryType {
   VALUE
   BELIEF
   GOAL
+}
+
+model Rule {
+  id     String @id @default(uuid())
+  userId BigInt
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  content     String  @db.Text // Само правило — краткая формулировка
+  description String? @db.Text // Пояснение/контекст (опционально)
+
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([isActive])
 }
