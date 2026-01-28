@@ -414,8 +414,8 @@ ${lastReport}
           { role: 'system', content: SYSTEM_PROMPT },
           { role: 'user', content: userMessageText },
         ],
-        1000,
-        0.95,
+        1200,
+        0.9,
       );
 
       this.logger.log('Ответ модели (raw):', rawResponse);
@@ -435,7 +435,7 @@ ${lastReport}
       // Извлекаем текст для отправки пользователю (например, из поля `text` или `response`)
       // ← Уточните, откуда берётся `aiResponse.text` в вашем текущем коде.
       // Предположим, что модель возвращает объект с полем `text`.
-      const aiText = parsed.text || rawResponse; // fallback на случай ошибки
+      const aiText = this.generateReadableText(parsed);
 
       // Сохраняем структурированный анализ
       await this.prisma.interaction.create({
@@ -459,6 +459,7 @@ ${lastReport}
           ineffectivenessReason: parsed.analysis?.ineffectiveness_reason ?? '',
           hiddenNeed: parsed.analysis?.hidden_need ?? '',
           alternatives: parsed.alternatives ?? [],
+          physiology: parsed.phusiology ?? null,
           rawResponse,
         },
       });
@@ -469,6 +470,55 @@ ${lastReport}
       this.logger.error('Ошибка при обработке запроса:', error);
       await ctx.reply('⚠️ Произошла ошибка. Попробуйте позже.');
     }
+  }
+
+  // Функция для преобразования JSON-анализа в читаемый текст
+  private generateReadableText(parsed: any): string {
+    const lines: string[] = [];
+
+    // 1. Цепь событий
+    lines.push(`1. ЦЕПЬ:`);
+    lines.push(`   Триггер — ${parsed.chain?.trigger || '-'}`);
+    lines.push(`   Мысль — "${parsed.chain?.thought || '-'}"`);
+    lines.push(
+      `   Эмоция — ${parsed.chain?.emotion?.name || '-'} (${parsed.chain?.emotion?.intensity || 0}/10)`,
+    );
+    lines.push(`   Действие — ${parsed.chain?.action || '-'}`);
+    lines.push(`   Последствие — ${parsed.chain?.consequence || '-'}`);
+
+    // 2. Паттерны
+    lines.push(`2. ПАТТЕРНЫ: ${(parsed.patterns || []).join(', ') || '-'}`);
+
+    // 3. Анализ
+    lines.push(`3. АНАЛИЗ:`);
+    lines.push(`   Цель — ${parsed.analysis?.goal || '-'}`);
+    lines.push(
+      `   Не сработало — ${parsed.analysis?.ineffectiveness_reason || '-'}`,
+    );
+    lines.push(
+      `   Скрытая потребность — ${parsed.analysis?.hidden_need || '-'}`,
+    );
+
+    // 4. Физиология
+    if (parsed.physiology) {
+      lines.push(`4. ФИЗИОЛОГИЯ:`);
+      lines.push(`   Амигдала: ${parsed.physiology.amygdala_mechanism || '-'}`);
+      lines.push(`   Протокол: ${parsed.physiology.binary_protocol || '-'}`);
+      lines.push(`   Тело: ${parsed.physiology.physical_markers || '-'}`);
+      lines.push(`   ПФК: ${parsed.physiology.pfk_override_strategy || '-'}`);
+    }
+
+    // 5. Альтернативы
+    lines.push(`5. АЛЬТЕРНАТИВЫ:`);
+    if (parsed.alternatives?.length > 0) {
+      parsed.alternatives.forEach((alt: string, index: number) => {
+        lines.push(`   ${index + 1}) ${alt}`);
+      });
+    } else {
+      lines.push(`   -`);
+    }
+
+    return lines.join('\n');
   }
 
   private isStateCheckMessage(text: string): boolean {
@@ -797,25 +847,21 @@ ${lastReport}
     if (interactions.length === 0) return '';
 
     return interactions
-      .map((i) => {
-        const patterns = Array.isArray(i.patterns)
-          ? i.patterns
-          : JSON.parse(i.patterns as any);
-        const alternatives = Array.isArray(i.alternatives)
-          ? i.alternatives
-          : JSON.parse(i.alternatives as any);
-
-        return `[${i.createdAt.toLocaleDateString()}]
-Цель: "${i.goal || 'не указана'}"
-Триггер: "${i.trigger}"
-Мысль: "${i.thought}"
-Эмоция: ${i.emotionName} (${i.emotionIntensity}/10)
-Действие: "${i.action}"
-Последствие: "${i.consequence}"
-Скрытая потребность: "${i.hiddenNeed || 'не распознана'}"
-Паттерны: ${patterns.length > 0 ? patterns.join(', ') : '—'}
-Альтернативы: ${alternatives.length > 0 ? alternatives.join('; ') : '—'}`;
+      .map((interaction) => {
+        try {
+          // Парсим rawResponse
+          const rawData = JSON.parse(interaction.rawResponse);
+          // Если в rawData уже есть text, используем его
+          if (rawData.text) {
+            return rawData.text;
+          }
+          // Иначе генерируем из структуры
+          return this.generateReadableText(rawData);
+        } catch (error) {
+          this.logger.error(`Ошибка парсинга для ${interaction.id}`, error);
+          return `Ошибка отображения разбора от ${new Date(interaction.createdAt).toLocaleDateString()}`;
+        }
       })
-      .join('\n\n');
+      .join('\n\n---\n\n');
   }
 }
