@@ -56,6 +56,37 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       );
     });
 
+    this.bot.command('file', async (ctx: MyContext) => {
+      try {
+        const user = await this.ensureUser(ctx);
+
+        const userId = user.id;
+        const interactions = await this.prisma.interaction.findMany({
+          where: { userId },
+          orderBy: { createdAt: 'asc' },
+        });
+
+        if (!interactions.length) {
+          await ctx.reply('Нет записей');
+          return;
+        }
+
+        const text = this.formatInteractions(interactions);
+        const filename = `analysis_${Date.now()}.txt`;
+
+        require('fs').writeFileSync(filename, text);
+
+        await ctx.replyWithDocument({
+          source: filename,
+          filename: filename,
+        });
+
+        require('fs').unlinkSync(filename);
+      } catch (e) {
+        await ctx.reply('Ошибка: ' + e.message);
+      }
+    });
+
     this.bot.command('analyze', async (ctx: MyContext) => {
       const user = await this.ensureUser(ctx);
 
@@ -459,7 +490,7 @@ ${lastReport}
           ineffectivenessReason: parsed.analysis?.ineffectiveness_reason ?? '',
           hiddenNeed: parsed.analysis?.hidden_need ?? '',
           alternatives: parsed.alternatives ?? [],
-          physiology: parsed.phusiology ?? null,
+          physiology: parsed.physiology ?? null,
           rawResponse,
         },
       });
@@ -478,44 +509,43 @@ ${lastReport}
 
     // 1. Цепь событий
     lines.push(`1. ЦЕПЬ:`);
-    lines.push(`   Триггер — ${parsed.chain?.trigger || '-'}`);
-    lines.push(`   Мысль — "${parsed.chain?.thought || '-'}"`);
+    lines.push(`Триггер — ${parsed.chain?.trigger || '-'}`);
+    lines.push(`Мысль — "${parsed.chain?.thought || '-'}"`);
     lines.push(
-      `   Эмоция — ${parsed.chain?.emotion?.name || '-'} (${parsed.chain?.emotion?.intensity || 0}/10)`,
+      `Эмоция — ${parsed.chain?.emotion?.name || '-'} (${parsed.chain?.emotion?.intensity || 0}/10)`,
     );
-    lines.push(`   Действие — ${parsed.chain?.action || '-'}`);
-    lines.push(`   Последствие — ${parsed.chain?.consequence || '-'}`);
+    lines.push(`Действие — ${parsed.chain?.action || '-'}`);
+    lines.push(`Последствие — ${parsed.chain?.consequence || '-'}`);
 
     // 2. Паттерны
     lines.push(`2. ПАТТЕРНЫ: ${(parsed.patterns || []).join(', ') || '-'}`);
 
     // 3. Анализ
     lines.push(`3. АНАЛИЗ:`);
-    lines.push(`   Цель — ${parsed.analysis?.goal || '-'}`);
+    lines.push(`Цель — ${parsed.analysis?.goal || '-'}`);
     lines.push(
-      `   Не сработало — ${parsed.analysis?.ineffectiveness_reason || '-'}`,
+      `Не сработало — ${parsed.analysis?.ineffectiveness_reason || '-'}`,
     );
-    lines.push(
-      `   Скрытая потребность — ${parsed.analysis?.hidden_need || '-'}`,
-    );
+    lines.push(`Скрытая потребность — ${parsed.analysis?.hidden_need || '-'}`);
 
     // 4. Физиология
     if (parsed.physiology) {
       lines.push(`4. ФИЗИОЛОГИЯ:`);
-      lines.push(`   Амигдала: ${parsed.physiology.amygdala_mechanism || '-'}`);
-      lines.push(`   Протокол: ${parsed.physiology.binary_protocol || '-'}`);
-      lines.push(`   Тело: ${parsed.physiology.physical_markers || '-'}`);
-      lines.push(`   ПФК: ${parsed.physiology.pfk_override_strategy || '-'}`);
+      lines.push(`Амигдала: ${parsed.physiology.amygdala_mechanism || '-'}`);
+      lines.push(`Протокол: ${parsed.physiology.binary_protocol || '-'}`);
+      lines.push(`Тело: ${parsed.physiology.physical_markers || '-'}`);
+      lines.push(`ПФК: ${parsed.physiology.pfk_override_strategy || '-'}`);
     }
 
     // 5. Альтернативы
     lines.push(`5. АЛЬТЕРНАТИВЫ:`);
     if (parsed.alternatives?.length > 0) {
       parsed.alternatives.forEach((alt: string, index: number) => {
-        lines.push(`   ${index + 1}) ${alt}`);
+        lines.push(`${index + 1}) ${alt}`);
       });
     } else {
-      lines.push(`   -`);
+      lines.push(`
+        -`);
     }
 
     return lines.join('\n');
