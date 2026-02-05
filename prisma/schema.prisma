@@ -23,6 +23,7 @@ model User {
   interactions Interaction[] // ← новое
   JournalEntry JournalEntry[]
   rules        Rule[]
+  DailyStats   DailyStats[]
 }
 
 model Message {
@@ -127,4 +128,28 @@ model Rule {
 
   @@index([userId])
   @@index([isActive])
+}
+
+model DailyStats {
+  id                BigInt    @id @default(autoincrement())
+  userId            BigInt
+  user              User      @relation(fields: [userId], references: [id])
+  date              DateTime
+
+  messageCount      Int       @default(1)
+  totalMessageChars Int       @default(0)
+
+  // === Массивы по каждому сообщению (индексы совпадают) ===
+  emotions             Json   // ["shame", "anxiety", ...]
+  topics               Json   // ["work", "self-worth", ...]
+  messageTimestamps    Json   // ["12:15", "14:33", ...]
+  messageWordCounts    Json   // [12, 45, 8, ...]
+  typosPerMessage      Json   // [2, 0, 5, ...] ← новое поле
+  sentimentScores      Json   // [0.2, -0.7, ...]
+  emotionalIntensities Json   // [6, 9, ...]
+
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@unique([userId, date])
 }

@@ -705,11 +705,10 @@ ${lastReport}
     if (sender === 'user') {
       // Запускаем асинхронно, чтобы не блокировать ответ пользователю
       setImmediate(() => {
-        this.createJournalEntryFromMessage(userId, message.id, content).catch(
-          () => {
-            /* ошибки уже залогированы внутри */
-          },
-        );
+        // this.createJournalEntryFromMessage(userId, message.id, content).catch(
+        //   () => {},
+        // );
+        this.processMessageForDailyStats(userId, content).catch(() => {});
       });
     }
   }
@@ -893,5 +892,134 @@ ${lastReport}
         }
       })
       .join('\n\n---\n\n');
+  }
+
+  private async processMessageForDailyStats(
+    userId: bigint,
+    messageText: string,
+  ): Promise<void> {
+    const trimmed = messageText.trim();
+    if (!trimmed || /^\/[a-z0-9_]+/i.test(trimmed)) {
+      return;
+    }
+
+    try {
+      const promptTemplate = fs.readFileSync(
+        path.join(
+          process.cwd(),
+          'src',
+          'llm',
+          'prompts',
+          'message_to_daily_stats.txt',
+        ),
+        'utf-8',
+      );
+      const prompt = promptTemplate.replace('{{MESSAGE}}', trimmed);
+
+      const rawResponse = await this.callLLM(
+        [{ role: 'user', content: prompt }],
+        400,
+        0.2,
+      );
+
+      let parsed;
+      try {
+        parsed = JSON.parse(rawResponse);
+      } catch (e) {
+        this.logger.warn('Не удалось распарсить daily stats:', rawResponse);
+        return;
+      }
+
+      if (
+        !parsed?.primaryEmotion ||
+        !parsed?.topicTag ||
+        typeof parsed.typosCount !== 'number' ||
+        typeof parsed.sentimentScore !== 'number' ||
+        typeof parsed.emotionalIntensity !== 'number'
+      ) {
+        this.logger.warn('Неполный ответ от LLM для daily stats:', parsed);
+        return;
+      }
+
+      // --- Локальные вычисления ---
+      const messageLength = trimmed.length;
+      const wordCount = trimmed.split(/\s+/).filter((w) => w.length > 0).length;
+      const typosCount = Math.max(0, Math.round(parsed.typosCount)); // целое ≥0
+      const primaryEmotion = String(parsed.primaryEmotion).toLowerCase();
+      const topicTag = String(parsed.topicTag)
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, '_');
+      const sentimentScore = parseFloat(parsed.sentimentScore.toFixed(1));
+      const emotionalIntensity = Math.min(
+        10,
+        Math.max(1, Math.round(parsed.emotionalIntensity)),
+      );
+
+      const now = new Date();
+      const utcHours = String(now.getUTCHours()).padStart(2, '0');
+      const utcMinutes = String(now.getUTCMinutes()).padStart(2, '0');
+      const timestampStr = `${utcHours}:${utcMinutes}`;
+      const todayStart = new Date(
+        Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
+      );
+
+      // --- Обновление ---
+      let existing = await this.prisma.dailyStats.findUnique({
+        where: { userId_date: { userId, date: todayStart } },
+      });
+
+      if (existing) {
+        await this.prisma.dailyStats.update({
+          where: { id: existing.id },
+          data: {
+            messageCount: { increment: 1 },
+            totalMessageChars: { increment: messageLength },
+            emotions: [...(existing.emotions as string[]), primaryEmotion],
+            topics: [...(existing.topics as string[]), topicTag],
+            messageTimestamps: [
+              ...(existing.messageTimestamps as string[]),
+              timestampStr,
+            ],
+            messageWordCounts: [
+              ...(existing.messageWordCounts as number[]),
+              wordCount,
+            ],
+            typosPerMessage: [
+              ...(existing.typosPerMessage as number[]),
+              typosCount,
+            ], // ← здесь
+            sentimentScores: [
+              ...(existing.sentimentScores as number[]),
+              sentimentScore,
+            ],
+            emotionalIntensities: [
+              ...(existing.emotionalIntensities as number[]),
+              emotionalIntensity,
+            ],
+          },
+        });
+      } else {
+        await this.prisma.dailyStats.create({
+          data: {
+            userId,
+            date: todayStart,
+            messageCount: 1,
+            totalMessageChars: messageLength,
+            emotions: [primaryEmotion],
+            topics: [topicTag],
+            messageTimestamps: [timestampStr],
+            messageWordCounts: [wordCount],
+            typosPerMessage: [typosCount], // ← и здесь
+            sentimentScores: [sentimentScore],
+            emotionalIntensities: [emotionalIntensity],
+          },
+        });
+      }
+
+      this.logger.debug(`Обновлена дневная статистика для userId=${userId}`);
+    } catch (error) {
+      this.logger.error('Ошибка при обновлении DailyStats:', error.message);
+    }
   }
 }
