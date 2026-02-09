@@ -16,6 +16,7 @@ interface MySession {
   awaitingRuleContent?: boolean;
   awaitingRuleDescription?: boolean;
   ruleContent?: string;
+  awaitingFileDays?: boolean; // ← новое поле
 }
 
 type MyContext = Context & { session: MySession };
@@ -57,34 +58,12 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     });
 
     this.bot.command('file', async (ctx: MyContext) => {
-      try {
-        const user = await this.ensureUser(ctx);
-
-        const userId = user.id;
-        const interactions = await this.prisma.interaction.findMany({
-          where: { userId },
-          orderBy: { createdAt: 'asc' },
-        });
-
-        if (!interactions.length) {
-          await ctx.reply('Нет записей');
-          return;
-        }
-
-        const text = this.formatInteractions(interactions);
-        const filename = `analysis_${Date.now()}.txt`;
-
-        require('fs').writeFileSync(filename, text);
-
-        await ctx.replyWithDocument({
-          source: filename,
-          filename: filename,
-        });
-
-        require('fs').unlinkSync(filename);
-      } catch (e) {
-        await ctx.reply('Ошибка: ' + e.message);
+      if (!ctx.session) {
+        ctx.session = {};
       }
+
+      ctx.session.awaitingFileDays = true;
+      await ctx.reply('За сколько дней выгрузить отчёт? (введите число)');
     });
 
     this.bot.command('analyze', async (ctx: MyContext) => {
@@ -211,6 +190,17 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
       if (ctx.session?.postAnalysisMode) {
         return this.handlePostAnalysisMessage(ctx, userText);
+      }
+
+      if (ctx.session?.awaitingFileDays) {
+        ctx.session.awaitingFileDays = false;
+
+        // Парсим число или используем 10 по умолчанию
+        const days = /^\d+$/.test(userText.trim())
+          ? parseInt(userText.trim(), 10)
+          : 10;
+
+        return this.handleFileExport(ctx, days);
       }
 
       return this.handleRegularMessage(ctx, userText);
@@ -1020,6 +1010,219 @@ ${lastReport}
       this.logger.debug(`Обновлена дневная статистика для userId=${userId}`);
     } catch (error) {
       this.logger.error('Ошибка при обновлении DailyStats:', error.message);
+    }
+  }
+
+  private async handleFileExport(ctx: MyContext, days: number) {
+    try {
+      const user = await this.ensureUser(ctx);
+
+      // Вычисляем дату начала периода
+      const since = new Date();
+      since.setDate(since.getDate() - days);
+
+      // Запрашиваем взаимодействия за период
+      const interactions = await this.prisma.interaction.findMany({
+        where: {
+          userId: user.id,
+          createdAt: { gte: since },
+        },
+        orderBy: { createdAt: 'desc' },
+        include: { userMessage: true },
+      });
+
+      if (!interactions.length) {
+        await ctx.reply(`Нет записей за последние ${days} дн.`);
+        return;
+      }
+
+      const wrapText = (text: string, maxWidth = 80): string => {
+        if (!text) return '';
+
+        // Разбиваем на абзацы (сохраняем пустые строки как разделители)
+        const paragraphs = text.split('\n');
+
+        const wrappedParagraphs = paragraphs.map((paragraph) => {
+          if (!paragraph.trim()) return ''; // сохраняем пустые строки
+
+          const words = paragraph.trim().split(/\s+/);
+          const lines: string[] = [];
+          let currentLine = '';
+
+          for (const word of words) {
+            // Если слово влезает в текущую строку — добавляем
+            if (
+              currentLine.length + word.length + (currentLine ? 1 : 0) <=
+              maxWidth
+            ) {
+              currentLine = currentLine ? `${currentLine} ${word}` : word;
+            }
+            // Иначе — завершаем текущую строку и начинаем новую
+            else {
+              if (currentLine) lines.push(currentLine);
+              currentLine = word;
+            }
+          }
+
+          // Не забываем последнюю строку
+          if (currentLine) lines.push(currentLine);
+
+          return lines.join('\n');
+        });
+
+        return wrappedParagraphs.join('\n');
+      };
+
+      // Минимальный текст отчёта
+      const lines = [
+        `Отчёт за ${days} дн. (${since.toLocaleDateString('ru-RU')} – ${new Date().toLocaleDateString('ru-RU')})`,
+        `Всего записей: ${interactions.length}`,
+        '',
+      ];
+
+      for (const interaction of interactions) {
+        // === Сообщение пользователя с переносом ===
+        if (interaction.userMessage?.content) {
+          const wrappedContent = wrapText(
+            interaction.userMessage.content.trim(),
+            76,
+          ); // 76 = 80 - 4 символа отступа
+          const indented = wrappedContent
+            .split('\n')
+            .map((line) => `    ${line}`) // отступ 4 пробела для читаемости
+            .join('\n');
+
+          lines.push(`Пользователь:\n${indented}`);
+        }
+
+        // === Ответ бота — структурированный анализ ===
+        lines.push('Бот: Анализ ситуации');
+
+        lines.push(
+          `Триггер: ${wrapText(interaction.trigger, 76)
+            .split('\n')
+            .map((l) => `    ${l}`)
+            .join('\n')}`,
+        );
+        lines.push(
+          `Мысль: ${wrapText(interaction.thought, 76)
+            .split('\n')
+            .map((l) => `    ${l}`)
+            .join('\n')}`,
+        );
+        lines.push(
+          `Эмоция: ${interaction.emotionName} (${interaction.emotionIntensity}/10)`,
+        );
+        lines.push(
+          `Действие: ${wrapText(interaction.action, 76)
+            .split('\n')
+            .map((l) => `    ${l}`)
+            .join('\n')}`,
+        );
+        lines.push(
+          `Последствие: ${wrapText(interaction.consequence, 76)
+            .split('\n')
+            .map((l) => `    ${l}`)
+            .join('\n')}`,
+        );
+
+        // Паттерны
+        if (
+          Array.isArray(interaction.patterns) &&
+          interaction.patterns?.length
+        ) {
+          const patterns = Array.isArray(interaction.patterns)
+            ? interaction.patterns
+            : JSON.parse(JSON.stringify(interaction.patterns));
+          if (patterns.length) {
+            lines.push(`Паттерны: ${patterns.join(', ')}`);
+          }
+        }
+
+        lines.push(
+          `Цель: ${wrapText(interaction.goal, 76)
+            .split('\n')
+            .map((l) => `    ${l}`)
+            .join('\n')}`,
+        );
+        lines.push(
+          `Причина неэффективности: ${wrapText(
+            interaction.ineffectivenessReason,
+            76,
+          )
+            .split('\n')
+            .map((l) => `    ${l}`)
+            .join('\n')}`,
+        );
+        lines.push(
+          `Скрытая потребность: ${wrapText(interaction.hiddenNeed, 76)
+            .split('\n')
+            .map((l) => `    ${l}`)
+            .join('\n')}`,
+        );
+
+        // Физиология
+        if (interaction.physiology) {
+          try {
+            const phys =
+              typeof interaction.physiology === 'object'
+                ? interaction.physiology
+                : JSON.parse(interaction.physiology as string);
+            if (phys.mechanism) {
+              lines.push(
+                `Физиология: ${wrapText(phys.mechanism, 76)
+                  .split('\n')
+                  .map((l) => `    ${l}`)
+                  .join('\n')}`,
+              );
+            }
+          } catch (e) {}
+        }
+
+        // Альтернативы
+        if (
+          Array.isArray(interaction.alternatives) &&
+          interaction.alternatives?.length
+        ) {
+          const alts = Array.isArray(interaction.alternatives)
+            ? interaction.alternatives
+            : JSON.parse(JSON.stringify(interaction.alternatives));
+          if (alts.length) {
+            lines.push('Альтернативы:');
+            alts.forEach((alt: string, i: number) => {
+              const wrapped = wrapText(alt, 72); // 72 = 80 - 4 (отступ) - 4 (нумерация)
+              wrapped.split('\n').forEach((line, idx) => {
+                if (idx === 0) {
+                  lines.push(`    ${i + 1}. ${line}`);
+                } else {
+                  lines.push(`       ${line}`); // отступ под нумерацию
+                }
+              });
+            });
+          }
+        }
+
+        lines.push(
+          `Дата анализа: ${interaction.createdAt.toLocaleString('ru-RU')}`,
+        );
+        lines.push('─'.repeat(80)); // визуальный разделитель между записями
+        lines.push(''); // дополнительный отступ
+      }
+
+      // Сохраняем во временный файл
+      const filename = `report_${Date.now()}.txt`;
+      require('fs').writeFileSync(filename, lines.join('\n'), 'utf8');
+
+      await ctx.replyWithDocument({
+        source: filename,
+        filename: `отчёт_${days}дн.txt`,
+      });
+
+      require('fs').unlinkSync(filename);
+      await ctx.reply(`✅ Готово. Записей: ${interactions.length}`);
+    } catch (e) {
+      console.error('file export error:', e);
+      await ctx.reply(`❌ Ошибка: ${e.message || 'неизвестная'}`);
     }
   }
 }
