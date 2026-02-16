@@ -8,25 +8,24 @@ import { message } from 'telegraf/filters';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { timeStamp } from 'console';
 import cron from 'node-cron';
+import { MyContext } from './interfaces';
+import { LlmService } from 'src/llm/llm.service';
+import { DatabaseService } from 'src/database/database.service';
+import { errorMiddleware } from './bot.middleware';
 
-interface MySession {
-  postAnalysisMode?: boolean;
-  lastAnalysisReport?: string;
-  coreMode?: boolean;
-  awaitingRuleContent?: boolean;
-  awaitingRuleDescription?: boolean;
-  ruleContent?: string;
-}
+// src/bot/bot.service.ts
 
-type MyContext = Context & { session: MySession };
+type MyCtx = MyContext;
 
 @Injectable()
 export class BotService implements OnModuleInit, OnModuleDestroy {
-  private bot: Telegraf<MyContext>;
+  private bot: Telegraf<MyCtx>;
   private logger = new Logger(BotService.name);
-  private SYSTEM_PROMPT: string;
 
-  constructor(private prisma: PrismaService) {
+  constructor(
+    private llm: LlmService,
+    private db: DatabaseService,
+  ) {
     const token = process.env.TELEGRAM_BOT_TOKEN;
     if (!token) {
       throw new Error('TELEGRAM_BOT_TOKEN is not defined in .env');
@@ -35,20 +34,28 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleInit() {
-    // Поддержка сессий (даже если не используем — нужна для контекста)
     this.bot.use(session());
-    const promptPath = path.join(
-      process.cwd(),
-      'src',
-      'llm',
-      'prompts',
-      'DBTpromt1.txt',
-    );
-    this.startStateCheckCron();
+    this.bot.use(errorMiddleware);
 
-    this.SYSTEM_PROMPT = fs.readFileSync(promptPath, 'utf-8').trim();
+    this.registerCommands();
+    this.registerHandlers();
 
-    // Команда /start
+    try {
+      await this.bot.launch();
+      this.logger.log('✅ Telegram bot запущен!');
+    } catch (error) {
+      this.logger.error('❌ Ошибка при запуске Telegram бота:', error);
+      throw error;
+    }
+  }
+
+  async onModuleDestroy() {
+    await this.bot.stop('SIGTERM');
+  }
+
+  // ==================== КОМАНДЫ ====================
+
+  private registerCommands() {
     this.bot.command('start', async (ctx) => {
       await this.ensureUser(ctx);
       await ctx.reply(
@@ -56,15 +63,10 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       );
     });
 
-    this.bot.command('file', async (ctx: MyContext) => {
+    this.bot.command('file', async (ctx) => {
       try {
-        const user = await this.ensureUser(ctx);
-
-        const userId = user.id;
-        const interactions = await this.prisma.interaction.findMany({
-          where: { userId },
-          orderBy: { createdAt: 'asc' },
-        });
+        const userId = BigInt(ctx.from.id);
+        const interactions = await this.db.getInteractions(userId);
 
         if (!interactions.length) {
           await ctx.reply('Нет записей');
@@ -73,84 +75,76 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
         const text = this.formatInteractions(interactions);
         const filename = `analysis_${Date.now()}.txt`;
+        const filepath = path.join(process.cwd(), filename);
 
-        require('fs').writeFileSync(filename, text);
+        fs.writeFileSync(filepath, text);
 
         await ctx.replyWithDocument({
-          source: filename,
+          source: filepath,
           filename: filename,
         });
 
-        require('fs').unlinkSync(filename);
+        fs.unlinkSync(filepath);
       } catch (e) {
-        await ctx.reply('Ошибка: ' + e.message);
+        this.logger.error('Ошибка команды /file:', e);
+        await ctx.reply('Ошибка: ' + (e as Error).message);
       }
     });
 
-    this.bot.command('analyze', async (ctx: MyContext) => {
-      const user = await this.ensureUser(ctx);
-
-      if (!ctx.session) {
-        ctx.session = {};
-      }
-
-      await ctx.reply('Генерирую персональный отчёт...');
-
+    this.bot.command('analyze', async (ctx) => {
       try {
-        const report = await this.generateBehaviorReport(user.id);
-        await this.sendLongMessage(ctx, report, user.id);
+        const userId = BigInt(ctx.from.id);
+        await this.ensureUser(ctx);
+
+        if (!ctx.session) ctx.session = {};
+
+        await ctx.reply('Генерирую персональный отчёт...');
+
+        const report = await this.db.generateBehaviorReport(userId, this.llm);
+        await this.sendLongMessage(ctx, report, userId);
 
         ctx.session.postAnalysisMode = true;
         ctx.session.lastAnalysisReport = report;
       } catch (error) {
-        this.logger.error('Ошибка генерации отчёта:', error.message);
+        this.logger.error('Ошибка генерации отчёта:', error);
         await ctx.reply('❌ Не удалось создать отчёт.');
       }
     });
 
-    this.bot.command('core', async (ctx: MyContext) => {
-      const user = await this.ensureUser(ctx);
+    this.bot.command('core', async (ctx) => {
+      await this.ensureUser(ctx);
+      if (!ctx.session) ctx.session = {};
 
-      if (!ctx.session) {
-        ctx.session = {};
-      }
-
-      // Выключаем другие режимы
       ctx.session.postAnalysisMode = false;
       delete ctx.session.lastAnalysisReport;
-
-      // Включаем core-режим
       ctx.session.coreMode = true;
 
       await ctx.reply('🧠 Включён Core Mode. Спроси у себя вопрос.');
     });
 
-    this.bot.command('done', async (ctx: MyContext) => {
-      if (!ctx.session) {
-        ctx.session = {};
-      }
+    this.bot.command('done', async (ctx) => {
+      if (!ctx.session) ctx.session = {};
 
-      // Сбрасываем все специальные режимы
       ctx.session.postAnalysisMode = false;
       ctx.session.coreMode = false;
+      ctx.session.awaitingRuleContent = false;
+      ctx.session.awaitingRuleDescription = false;
       delete ctx.session.lastAnalysisReport;
+      delete ctx.session.ruleContent;
 
       await ctx.reply(
         '✅ Вернулись в обычный режим. Присылайте новую ситуацию.',
       );
     });
 
-    this.bot.command('add_rule', async (ctx: MyContext) => {
-      const user = await this.ensureUser(ctx);
-
+    this.bot.command('add_rule', async (ctx) => {
+      await this.ensureUser(ctx);
       if (!ctx.session) ctx.session = {};
 
-      // Сбрасываем другие режимы
       ctx.session.coreMode = false;
       ctx.session.postAnalysisMode = false;
       delete ctx.session.lastAnalysisReport;
 
-      // Включаем режим добавления правила
       ctx.session.awaitingRuleContent = true;
       ctx.session.awaitingRuleDescription = false;
 
@@ -162,40 +156,51 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       );
     });
 
-    this.bot.command('codex', async (ctx: MyContext) => {
-      const user = await this.ensureUser(ctx);
+    this.bot.command('codex', async (ctx) => {
+      try {
+        const userId = BigInt(ctx.from.id);
+        await this.ensureUser(ctx);
 
-      const rules = await this.prisma.rule.findMany({
-        where: { userId: user.id, isActive: true },
-        orderBy: { createdAt: 'asc' },
-      });
+        const rules = await this.db.getUserRules(userId);
 
-      if (rules.length === 0) {
+        if (rules.length === 0) {
+          await ctx.reply(
+            '📖 Ваш кодекс пуст. Добавьте первое правило через /add_rule',
+          );
+          return;
+        }
+
+        const codexText = rules
+          .map(
+            (rule, idx) =>
+              `${idx + 1}. ${rule.content}${rule.description ? `\n   └─ ${rule.description}` : ''}`,
+          )
+          .join('\n\n');
+
         await ctx.reply(
-          '📖 Ваш кодекс пуст. Добавьте первое правило через /add_rule',
+          `📖 Ваш кодекс (${rules.length} правил):\n\n${codexText}`,
         );
-        return;
+      } catch (error) {
+        this.logger.error('Ошибка команды /codex:', error);
+        await ctx.reply('⚠️ Не удалось загрузить кодекс.');
       }
-
-      const codexText = rules
-        .map(
-          (rule, idx) =>
-            `${idx + 1}. ${rule.content}${rule.description ? `\n   └─ ${rule.description}` : ''}`,
-        )
-        .join('\n\n');
-
-      await ctx.reply(
-        `📖 Ваш кодекс (${rules.length} правил):\n\n${codexText}`,
-      );
     });
+  }
 
-    // === Основной обработчик текста ===
-    this.bot.on(message('text'), async (ctx: MyContext) => {
+  // ==================== ОБРАБОТЧИКИ СООБЩЕНИЙ ====================
+
+  private registerHandlers() {
+    this.bot.on(message('text'), async (ctx) => {
       const msg = ctx.message;
       if (!msg || !('text' in msg)) return;
 
       const userText = msg.text;
+      const userId = BigInt(ctx.from.id);
 
+      await this.ensureUser(ctx);
+      await this.db.saveMessage(userId, userText, 'user');
+
+      // Приоритет: режимы сессии
       if (ctx.session?.awaitingRuleContent) {
         return this.handleRuleContent(ctx, userText);
       }
@@ -204,7 +209,6 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         return this.handleRuleDescription(ctx, userText);
       }
 
-      // Приоритет: сначала специальные режимы
       if (ctx.session?.coreMode) {
         return this.handleCoreModeMessage(ctx, userText);
       }
@@ -215,37 +219,13 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
       return this.handleRegularMessage(ctx, userText);
     });
-    // Запуск бота
-    try {
-      await this.bot.launch();
-      this.logger.log('✅ Telegram bot запущен!');
-    } catch (error) {
-      this.logger.error('❌ Ошибка при запуске Telegram бота:', error);
-      throw error;
-    }
   }
 
-  private startStateCheckCron() {
-    // Запуск каждые 4 часа
-    cron.schedule('0 9-23/3 * * *', async () => {
-      try {
-        await this.sendStateCheckToAllActiveUsers();
-      } catch (error) {
-        this.logger.error(
-          'Ошибка в крон-задаче sendStateCheckToAllActiveUsers:',
-          error,
-        );
-      }
-    });
-    this.logger.log('Запланирована крон-задача: опрос состояния каждые 4 часа');
-  }
+  // ==================== РЕЖИМЫ ====================
 
-  private async handleRuleContent(ctx: MyContext, content: string) {
-    const user = await this.ensureUser(ctx);
-
+  private async handleRuleContent(ctx: MyCtx, content: string) {
     if (!ctx.session) ctx.session = {};
 
-    // Сохраняем контент правила в сессии
     ctx.session.ruleContent = content.trim();
     ctx.session.awaitingRuleContent = false;
     ctx.session.awaitingRuleDescription = true;
@@ -256,8 +236,12 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     );
   }
 
-  private async handleRuleDescription(ctx: MyContext, input: string) {
-    const user = await this.ensureUser(ctx);
+  private async handleRuleDescription(ctx: MyCtx, input: string) {
+    if (!ctx.from) {
+      return;
+    }
+
+    const userId = BigInt(ctx.from.id);
 
     if (!ctx.session?.ruleContent) {
       await ctx.reply('❌ Сессия сбита. Начните заново через /add_rule');
@@ -265,126 +249,55 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    const content = ctx.session.ruleContent;
-    const description = input.trim() === '-' ? null : input.trim() || null;
+    try {
+      const content = ctx.session.ruleContent;
+      const description = input.trim() === '-' ? null : input.trim() || null;
 
-    // Сохраняем правило
-    await this.prisma.rule.create({
-      data: {
-        userId: user.id,
-        content,
-        description,
-      },
-    });
+      await this.db.createRule(userId, content, description);
 
-    // Подтверждение
-    let confirmation = `✅ Правило добавлено в кодекс:\n«${content}»`;
-    if (description) confirmation += `\n\nПояснение: ${description}`;
+      let confirmation = `✅ Правило добавлено в кодекс:\n«${content}»`;
+      if (description) confirmation += `\n\nПояснение: ${description}`;
 
-    await ctx.reply(confirmation);
+      await ctx.reply(confirmation);
+    } catch (error) {
+      this.logger.error('Ошибка сохранения правила:', error);
+      await ctx.reply('❌ Не удалось сохранить правило.');
+    }
 
-    // Сбрасываем сессию
     this.resetRuleSession(ctx);
   }
 
-  private resetRuleSession(ctx: MyContext) {
+  private resetRuleSession(ctx: MyCtx) {
     if (!ctx.session) return;
     delete ctx.session.awaitingRuleContent;
     delete ctx.session.awaitingRuleDescription;
     delete ctx.session.ruleContent;
   }
 
-  private async sendStateCheckToAllActiveUsers() {
-    const activeUsers = await this.prisma.user.findMany({
-      where: {
-        messages: {
-          some: {
-            createdAt: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
-          },
-        },
-      },
-      select: { id: true }, // ← только id, который и есть telegramId
-    });
-
-    for (const user of activeUsers) {
-      try {
-        // user.id — это BigInt, но Telegram Bot API принимает number или string
-        // В JS/TS number безопасен до 2^53, а Telegram ID < 2^53, так что можно привести к number
-        const chatId = Number(user.id);
-
-        await this.bot.telegram.sendMessage(
-          chatId,
-          '🧠 Как ты прямо сейчас?\n(Можно коротко: «устал», «радуюсь», «голоден», «раздражён» и т.д.)',
-        );
-      } catch (err) {
-        this.logger.warn(
-          `Не удалось отправить STATE_CHECK пользователю ${user.id}:`,
-          err.message,
-        );
-      }
-    }
-  }
-
-  async onModuleDestroy() {
-    await this.bot.stop('SIGTERM');
-  }
-
-  private async sendLongMessage(ctx: MyContext, text: string, userId: bigint) {
-    const MAX_LENGTH = 4096;
-
-    if (text.length <= MAX_LENGTH) {
-      await ctx.reply(text);
-      await this.saveMessage(userId, text, 'bot'); // ← универсальная функция
+  private async handlePostAnalysisMessage(ctx: MyCtx, userText: string) {
+    if (!ctx.from) {
       return;
     }
 
-    // Разбиваем на части, стараясь не резать слова
-    let start = 0;
-    while (start < text.length) {
-      let end = start + MAX_LENGTH;
-
-      if (end < text.length) {
-        const lastNewline = text.lastIndexOf('\n', end);
-        const lastSpace = text.lastIndexOf(' ', end);
-        const cutPoint = Math.max(lastNewline, lastSpace);
-        if (cutPoint > start) {
-          end = cutPoint;
-        }
-      }
-
-      const chunk = text.slice(start, end).trim();
-      await ctx.reply(chunk);
-      await this.saveMessage(userId, chunk, 'bot'); // ← универсальная функция
-      start = end;
-    }
-  }
-
-  private async handlePostAnalysisMessage(ctx: MyContext, userText: string) {
-    const user = await this.ensureUser(ctx);
+    const userId = BigInt(ctx.from.id);
     const text = userText.trim();
 
-    await this.saveMessage(user.id, text, 'user');
+    const exitWords = ['/done'];
 
-    const exitWords = [
-      'стоп',
-      'хватит',
-      'всё',
-      'спасибо',
-      'готово',
-      'конец',
-      '/done',
-    ];
     if (exitWords.some((word) => text.toLowerCase().includes(word))) {
-      ctx.session.postAnalysisMode = false;
-      delete ctx.session.lastAnalysisReport;
+      if (ctx.session) {
+        ctx.session.postAnalysisMode = false;
+        delete ctx.session.lastAnalysisReport;
+      }
       await ctx.reply(
         'Режим анализа завершён. Можете прислать новую ситуацию.',
       );
       return;
     }
 
-    const lastReport = ctx.session.lastAnalysisReport || '';
-    const qaPrompt = `
+    try {
+      const lastReport = ctx.session?.lastAnalysisReport || '';
+      const qaPrompt = `
 Ты — терапевт. Пользователь получил следующий анализ:
 
 ---
@@ -401,57 +314,48 @@ ${lastReport}
 - Максимум 3–4 предложения. Прямо. Без жаргона.
 `.trim();
 
-    try {
-      const aiText = await this.callLLM(
+      const aiText = await this.llm.callLLM(
         [{ role: 'user', content: qaPrompt }],
         300,
         0.7,
       );
-      await this.sendLongMessage(ctx, aiText, user.id);
+      await this.sendLongMessage(ctx, aiText, userId);
     } catch (error) {
-      this.logger.error('Ошибка в post-analysis режиме:', error.message);
+      this.logger.error('Ошибка в post-analysis режиме:', error);
       await ctx.reply('Не могу ответить сейчас. Но я здесь.');
     }
   }
 
-  // === Обычный режим: разбор новой ситуации ===
-  private async handleRegularMessage(ctx: MyContext, userText: string) {
-    const user = await this.ensureUser(ctx);
+  private async handleRegularMessage(ctx: MyCtx, userText: string) {
+    if (!ctx.from) {
+      return;
+    }
+
+    const userId = BigInt(ctx.from.id);
     const userMessageText = userText.trim();
 
-    // Сохраняем сообщение пользователя
-    await this.saveMessage(user.id, userMessageText, 'user');
-
-    // 🔹 Проверка: если это похоже на STATE_CHECK — не анализируем
     if (this.isStateCheckMessage(userMessageText)) {
       await ctx.reply('Спасибо, записал ✍️');
       return;
     }
 
     try {
-      // Загружаем основной промпт
-      const mainPromptPath = path.join(
-        process.cwd(),
-        'src',
-        'llm',
-        'prompts',
-        'DBTpromt1.txt',
-      );
-      const SYSTEM_PROMPT = fs.readFileSync(mainPromptPath, 'utf-8').trim();
+      const systemPrompt = this.llm.getPrompt('DBT');
 
-      // Получаем raw-ответ от модели (ожидается JSON-строка)
-      const rawResponse = await this.callLLM(
+      const rawResponse = await this.llm.callLLM(
         [
-          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'system', content: systemPrompt },
           { role: 'user', content: userMessageText },
         ],
         1200,
         0.9,
       );
 
-      this.logger.log('Ответ модели (raw):', rawResponse);
+      this.logger.log(
+        'Ответ модели (raw):',
+        rawResponse.substring(0, 200) + '...',
+      );
 
-      // Парсим JSON
       let parsed;
       try {
         parsed = JSON.parse(rawResponse);
@@ -463,22 +367,13 @@ ${lastReport}
         throw new Error('Некорректный формат ответа от ИИ');
       }
 
-      // Извлекаем текст для отправки пользователю (например, из поля `text` или `response`)
-      // ← Уточните, откуда берётся `aiResponse.text` в вашем текущем коде.
-      // Предположим, что модель возвращает объект с полем `text`.
       const aiText = this.generateReadableText(parsed);
 
-      // Сохраняем структурированный анализ
-      await this.prisma.interaction.create({
-        data: {
-          userId: user.id,
-          // Связываем с последним сообщением пользователя (можно уточнить логику)
-          userMessageId: (
-            await this.prisma.message.findFirst({
-              where: { userId: user.id, sender: 'user' },
-              orderBy: { createdAt: 'desc' },
-            })
-          )?.id,
+      const lastUserMessage = await this.db.getLastUserMessage(userId);
+
+      const result = await this.db.createInteraction(
+        userId,
+        {
           trigger: parsed.chain?.trigger ?? '',
           thought: parsed.chain?.thought ?? '',
           emotionName: parsed.chain?.emotion?.name ?? '',
@@ -493,21 +388,141 @@ ${lastReport}
           physiology: parsed.physiology ?? null,
           rawResponse,
         },
-      });
+        lastUserMessage?.id,
+      );
 
-      // Отправляем и сохраняем ответ бота
-      await this.sendLongMessage(ctx, aiText, user.id);
+      // Обработка результата
+      if (!result.created) {
+        this.logger.debug(`Взаимодействие не создано: ${result.reason}`);
+
+        // Опционально: сообщить пользователю, если это дубликат
+        if (result.reason === 'duplicate_message') {
+          // Можно отправить уведомление, но лучше молча пропустить
+        }
+      }
+
+      await this.sendLongMessage(ctx, aiText, userId);
+
+      // Асинхронная обработка статистики (не блокируем ответ)
+      this.processStatsSafe(userId, userMessageText);
     } catch (error) {
       this.logger.error('Ошибка при обработке запроса:', error);
       await ctx.reply('⚠️ Произошла ошибка. Попробуйте позже.');
     }
   }
 
-  // Функция для преобразования JSON-анализа в читаемый текст
+  private async handleCoreModeMessage(ctx: MyCtx, userText: string) {
+    if (!ctx.from) {
+      return;
+    }
+
+    const userId = BigInt(ctx.from.id);
+    const text = userText.trim();
+
+    if (['/done'].some((word) => text.toLowerCase().includes(word))) {
+      if (ctx.session) {
+        ctx.session.coreMode = false;
+      }
+      await ctx.reply('Режим Core завершён. Можете прислать новую ситуацию.');
+      return;
+    }
+
+    try {
+      const recentMessages = await this.db.getRecentUserMessages(userId, 3);
+      const journalEntries = await this.db.getJournalEntriesText(userId, 8);
+      const userRules = await this.db.getUserRulesForPrompt(userId);
+
+      let corePromptTemplate = this.llm.getPrompt('CORE');
+      if (!corePromptTemplate) {
+        corePromptTemplate = 'Ты — глубокий психолог. Проанализируй следующее:';
+      }
+
+      const fullSystemPrompt = corePromptTemplate
+        .replace('{{RECENT_MESSAGES}}', recentMessages)
+        .replace('{{JOURNAL_ENTRIES}}', journalEntries)
+        .replace('{{USER_RULES}}', userRules);
+
+      const aiText = await this.llm.callLLM(
+        [
+          { role: 'system', content: fullSystemPrompt },
+          { role: 'user', content: text },
+        ],
+        1000,
+        0.95,
+      );
+
+      await this.sendLongMessage(ctx, aiText, userId);
+    } catch (error) {
+      this.logger.error('Ошибка в core-режиме:', error);
+      await ctx.reply('Не могу ответить сейчас. Но я здесь.');
+    }
+  }
+
+  // ==================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ====================
+
+  private async ensureUser(ctx: MyCtx) {
+    if (!ctx.session) ctx.session = {};
+    const user = ctx.from;
+
+    if (!user) {
+      return;
+    }
+
+    await this.db.ensureUser(user.id, {
+      username: user.username || null,
+      firstName: user.first_name || null,
+      lastName: user.last_name || null,
+    });
+  }
+
+  private async sendLongMessage(ctx: MyCtx, text: string, userId: bigint) {
+    const MAX_LENGTH = 4096;
+
+    if (text.length <= MAX_LENGTH) {
+      await ctx.reply(text);
+      await this.db.saveMessage(userId, text, 'bot');
+      return;
+    }
+
+    let start = 0;
+    while (start < text.length) {
+      let end = start + MAX_LENGTH;
+
+      if (end < text.length) {
+        const lastNewline = text.lastIndexOf('\n', end);
+        const lastSpace = text.lastIndexOf(' ', end);
+        const cutPoint = Math.max(lastNewline, lastSpace);
+        if (cutPoint > start) {
+          end = cutPoint;
+        }
+      }
+
+      const chunk = text.slice(start, end).trim();
+      await ctx.reply(chunk);
+      await this.db.saveMessage(userId, chunk, 'bot');
+      start = end;
+    }
+  }
+
+  private isStateCheckMessage(text: string): boolean {
+    const trimmed = text.trim();
+    if (trimmed.length > 70) return false;
+
+    if (
+      trimmed.includes('потому что') ||
+      trimmed.includes('когда') ||
+      trimmed.includes('после того')
+    ) {
+      return false;
+    }
+
+    const words = trimmed.split(/\s+/).length;
+    return words <= 5;
+  }
+
   private generateReadableText(parsed: any): string {
     const lines: string[] = [];
 
-    // 1. Цепь событий
     lines.push(`1. ЦЕПЬ:`);
     lines.push(`Триггер — ${parsed.chain?.trigger || '-'}`);
     lines.push(`Мысль — "${parsed.chain?.thought || '-'}"`);
@@ -517,10 +532,8 @@ ${lastReport}
     lines.push(`Действие — ${parsed.chain?.action || '-'}`);
     lines.push(`Последствие — ${parsed.chain?.consequence || '-'}`);
 
-    // 2. Паттерны
     lines.push(`2. ПАТТЕРНЫ: ${(parsed.patterns || []).join(', ') || '-'}`);
 
-    // 3. Анализ
     lines.push(`3. АНАЛИЗ:`);
     lines.push(`Цель — ${parsed.analysis?.goal || '-'}`);
     lines.push(
@@ -528,7 +541,6 @@ ${lastReport}
     );
     lines.push(`Скрытая потребность — ${parsed.analysis?.hidden_need || '-'}`);
 
-    // 4. Физиология
     if (parsed.physiology) {
       lines.push(`4. ФИЗИОЛОГИЯ:`);
       lines.push(`Амигдала: ${parsed.physiology.amygdala_mechanism || '-'}`);
@@ -537,339 +549,16 @@ ${lastReport}
       lines.push(`ПФК: ${parsed.physiology.pfk_override_strategy || '-'}`);
     }
 
-    // 5. Альтернативы
     lines.push(`5. АЛЬТЕРНАТИВЫ:`);
     if (parsed.alternatives?.length > 0) {
       parsed.alternatives.forEach((alt: string, index: number) => {
         lines.push(`${index + 1}) ${alt}`);
       });
     } else {
-      lines.push(`
-        -`);
+      lines.push(`-`);
     }
 
     return lines.join('\n');
-  }
-
-  private isStateCheckMessage(text: string): boolean {
-    const trimmed = text.trim();
-    // Слишком длинное — не STATE_CHECK
-    if (trimmed.length > 70) return false;
-
-    // Содержит сложные конструкции? (признак анализа ситуации)
-    if (
-      trimmed.includes('потому что') ||
-      trimmed.includes('когда') ||
-      trimmed.includes('после того')
-    ) {
-      return false;
-    }
-
-    // Слишком короткое или простое — вероятно, состояние
-    const words = trimmed.split(/\s+/).length;
-    return words <= 5; // максимум 5 слов
-  }
-
-  private async ensureUser(ctx: MyContext): Promise<{ id: bigint }> {
-    const from = ctx.from;
-    if (!from) throw new Error('No user info in context');
-
-    const username = from.username || null;
-    const firstName = from.first_name || null;
-    const lastName = from.last_name || null;
-
-    const user = await this.prisma.user.upsert({
-      where: { id: BigInt(from.id) },
-      update: {
-        username,
-        firstName,
-        lastName,
-      },
-      create: {
-        id: BigInt(from.id), // используем строку как ID
-        username,
-        firstName,
-        lastName,
-      },
-    });
-
-    return { id: user.id };
-  }
-
-  private async generateBehaviorReport(userId: bigint): Promise<string> {
-    const interactions = await this.prisma.interaction.findMany({
-      where: { userId },
-      orderBy: { createdAt: 'desc' },
-      take: 5,
-    });
-
-    if (interactions.length === 0) {
-      return 'У вас пока нет сохранённых разборов. Напишите боту ситуацию, чтобы начать анализ.';
-    }
-
-    const historyText = this.formatInteractions(interactions);
-    const messagesText = await this.getRecentUserMessages(userId, 3);
-    const journalText = await this.getJournalEntriesText(userId, 8);
-    const userRules = await this.getUserRulesForPrompt(userId);
-
-    const promptTemplate = fs.readFileSync(
-      path.join(
-        process.cwd(),
-        'src',
-        'llm',
-        'prompts',
-        'BehaviorAnalysisPrompt.txt',
-      ),
-      'utf-8',
-    );
-
-    const prompt = promptTemplate
-      .replace('{{RECENT_MESSAGES}}', messagesText)
-      .replace('{{JOURNAL_ENTRIES}}', journalText)
-      .replace('{{HISTORY}}', historyText)
-      .replace('{{USER_RULES}}', userRules);
-
-    return await this.callLLM([{ role: 'user', content: prompt }], 1000, 0.9);
-  }
-
-  private async handleCoreModeMessage(ctx: MyContext, userText: string) {
-    const user = await this.ensureUser(ctx);
-    const text = userText.trim();
-
-    await this.saveMessage(user.id, text, 'user');
-
-    if (['/done'].some((word) => text.toLowerCase().includes(word))) {
-      ctx.session.coreMode = false;
-      await ctx.reply('Режим Core завершён. Можете прислать новую ситуацию.');
-      return;
-    }
-
-    // Получаем контекст
-    const recentMessages = await this.getRecentUserMessages(user.id, 3);
-    const journalEntries = await this.getJournalEntriesText(user.id, 8); // чуть меньше, чтобы не перегружать
-    const userRules = await this.getUserRulesForPrompt(user.id);
-
-    let CORE_PROMPT_TEMPLATE: string;
-    try {
-      const corePromptPath = path.join(
-        process.cwd(),
-        'src',
-        'llm',
-        'prompts',
-        'core_prompt.txt',
-      );
-      CORE_PROMPT_TEMPLATE = fs.readFileSync(corePromptPath, 'utf-8').trim();
-    } catch (err) {
-      this.logger.error('Не удалось загрузить core_prompt.txt:', err);
-      CORE_PROMPT_TEMPLATE = 'Ты — глубокий психолог. Проанализируй следующее:';
-    }
-
-    // Подставляем контекст в шаблон
-    const fullSystemPrompt = CORE_PROMPT_TEMPLATE.replace(
-      '{{RECENT_MESSAGES}}',
-      recentMessages,
-    )
-      .replace('{{JOURNAL_ENTRIES}}', journalEntries)
-      .replace('{{USER_RULES}}', userRules);
-
-    try {
-      const aiText = await this.callLLM(
-        [
-          { role: 'system', content: fullSystemPrompt },
-          { role: 'user', content: text },
-        ],
-        1000,
-        0.95,
-      );
-
-      await this.sendLongMessage(ctx, aiText, user.id);
-    } catch (error) {
-      this.logger.error('Ошибка в core-режиме:', error.message);
-      await ctx.reply('Не могу ответить сейчас. Но я здесь.');
-    }
-  }
-
-  private async saveMessage(
-    userId: bigint,
-    content: string,
-    sender: 'user' | 'bot',
-  ): Promise<void> {
-    const message = await this.prisma.message.create({
-      data: {
-        content,
-        sender, // ← enum значения должны совпадать с Prisma-схемой (у вас 'user'/'bot')
-        userId,
-      },
-    });
-
-    if (sender === 'user') {
-      // Запускаем асинхронно, чтобы не блокировать ответ пользователю
-      setImmediate(() => {
-        // this.createJournalEntryFromMessage(userId, message.id, content).catch(
-        //   () => {},
-        // );
-        this.processMessageForDailyStats(userId, content).catch(() => {});
-      });
-    }
-  }
-
-  private async callLLM(
-    messages: { role: 'system' | 'user' | 'assistant'; content: string }[],
-    maxTokens: number = 1000,
-    temperature: number = 0.95,
-  ): Promise<string> {
-    this.logger.log('messages', messages);
-
-    try {
-      const response = await axios.post(
-        'https://openrouter.ai/api/v1/chat/completions',
-        {
-          model: 'deepseek/deepseek-v3.2',
-          messages,
-          max_tokens: maxTokens,
-          temperature,
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-            'Content-Type': 'application/json',
-          },
-        },
-      );
-
-      return response.data.choices[0]?.message?.content?.trim() || '...';
-    } catch (error) {
-      this.logger.error('Ошибка вызова LLM:', error.message || error);
-      throw new Error('Не удалось получить ответ от модели.');
-    }
-  }
-
-  private async createJournalEntryFromMessage(
-    userId: bigint,
-    messageId: string,
-    messageText: string,
-  ): Promise<void> {
-    const trimmed = messageText.trim();
-
-    // 1. Игнорируем пустые сообщения
-    if (!trimmed) {
-      return;
-    }
-
-    // 2. Игнорируем команды Telegram
-    if (/^\/[a-z0-9_]+/i.test(trimmed)) {
-      return;
-    }
-
-    try {
-      const promptTemplate = fs.readFileSync(
-        path.join(
-          process.cwd(),
-          'src',
-          'llm',
-          'prompts',
-          'message_to_journal.txt',
-        ),
-        'utf-8',
-      );
-      const prompt = promptTemplate.replace('{{MESSAGE}}', trimmed);
-
-      const rawResponse = await this.callLLM(
-        [{ role: 'user', content: prompt }],
-        400,
-        0.3,
-      );
-
-      let parsed;
-      try {
-        parsed = JSON.parse(rawResponse);
-      } catch (e) {
-        this.logger.warn('Не удалось распарсить journal entry:', rawResponse);
-        return;
-      }
-
-      // 3. Если LLM вернул пустой/бессмысленный ответ — не сохраняем
-      if (!parsed?.content?.trim()) {
-        return;
-      }
-
-      await this.prisma.journalEntry.create({
-        data: {
-          userId,
-          sourceMessageId: messageId,
-          type: parsed.type || 'INSIGHT', // fallback
-          content: parsed.content.trim(),
-          description: parsed.description?.trim() || null,
-        },
-      });
-
-      this.logger.debug(
-        `Создана запись журнала для userId=${userId}: ${parsed.content}`,
-      );
-    } catch (error) {
-      this.logger.error('Ошибка при создании JournalEntry:', error.message);
-    }
-  }
-
-  private async getUserRulesForPrompt(userId: bigint): Promise<string> {
-    const rules = await this.prisma.rule.findMany({
-      where: { userId, isActive: true },
-      orderBy: { createdAt: 'asc' },
-      select: { content: true, description: true },
-    });
-
-    if (rules.length === 0) return 'NO_RULES';
-
-    return rules
-      .map((rule, idx) => {
-        const parts = [`RULE_${idx + 1}: "${rule.content}"`];
-        if (rule.description) {
-          parts.push(`  CONTEXT: "${rule.description}"`);
-        }
-        return parts.join('\n');
-      })
-      .join('\n\n');
-  }
-
-  private async getRecentUserMessages(
-    userId: bigint,
-    limit = 5,
-  ): Promise<string> {
-    const messages = await this.prisma.message.findMany({
-      where: { userId, sender: 'user' },
-      orderBy: { createdAt: 'desc' },
-      take: limit,
-      select: { content: true, createdAt: true },
-    });
-
-    if (messages.length === 0) return '— нет недавних сообщений';
-
-    return messages
-      .reverse()
-      .map((m) => `[${m.createdAt.toLocaleString()}] ${m.content}`)
-      .join('\n');
-  }
-
-  private async getJournalEntriesText(
-    userId: bigint,
-    limit = 20,
-  ): Promise<string> {
-    const entries = await this.prisma.journalEntry.findMany({
-      where: { userId },
-      orderBy: { createdAt: 'asc' },
-      take: limit,
-      select: { type: true, content: true, description: true, createdAt: true },
-    });
-
-    if (entries.length === 0) return '— нет записей';
-
-    return entries
-      .map(
-        (j) =>
-          `[${j.createdAt.toLocaleDateString()}] [${j.type}] ${j.content}` +
-          (j.description ? `\n  → ${j.description}` : ''),
-      )
-      .join('\n');
   }
 
   private formatInteractions(interactions: any[]): string {
@@ -878,13 +567,10 @@ ${lastReport}
     return interactions
       .map((interaction) => {
         try {
-          // Парсим rawResponse
           const rawData = JSON.parse(interaction.rawResponse);
-          // Если в rawData уже есть text, используем его
           if (rawData.text) {
             return rawData.text;
           }
-          // Иначе генерируем из структуры
           return this.generateReadableText(rawData);
         } catch (error) {
           this.logger.error(`Ошибка парсинга для ${interaction.id}`, error);
@@ -894,132 +580,38 @@ ${lastReport}
       .join('\n\n---\n\n');
   }
 
-  private async processMessageForDailyStats(
-    userId: bigint,
-    messageText: string,
-  ): Promise<void> {
-    const trimmed = messageText.trim();
-    if (!trimmed || /^\/[a-z0-9_]+/i.test(trimmed)) {
-      return;
-    }
-
-    try {
-      const promptTemplate = fs.readFileSync(
-        path.join(
-          process.cwd(),
-          'src',
-          'llm',
-          'prompts',
-          'message_to_daily_stats.txt',
-        ),
-        'utf-8',
-      );
-      const prompt = promptTemplate.replace('{{MESSAGE}}', trimmed);
-
-      const rawResponse = await this.callLLM(
-        [{ role: 'user', content: prompt }],
-        400,
-        0.2,
-      );
-
-      let parsed;
+  private processStatsSafe(userId: bigint, messageText: string) {
+    setImmediate(async () => {
       try {
-        parsed = JSON.parse(rawResponse);
-      } catch (e) {
-        this.logger.warn('Не удалось распарсить daily stats:', rawResponse);
-        return;
+        await this.db.processMessageForDailyStats(
+          userId,
+          messageText,
+          this.llm,
+        );
+      } catch (error) {
+        this.logger.warn('Ошибка обработки статистики:', error);
       }
+    });
+  }
 
-      if (
-        !parsed?.primaryEmotion ||
-        !parsed?.topicTag ||
-        typeof parsed.typosCount !== 'number' ||
-        typeof parsed.sentimentScore !== 'number' ||
-        typeof parsed.emotionalIntensity !== 'number'
-      ) {
-        this.logger.warn('Неполный ответ от LLM для daily stats:', parsed);
-        return;
+  // ==================== МЕТОД ДЛЯ CRON (вызывается из SchedulerService) ====================
+
+  async sendStateCheckToAllActiveUsers() {
+    const activeUsers = await this.db.getActiveUsersForCron();
+
+    for (const user of activeUsers) {
+      try {
+        const chatId = Number(user.id);
+        await this.bot.telegram.sendMessage(
+          chatId,
+          '🧠 Как ты прямо сейчас?\n(Можно коротко: «устал», «радуюсь», «голоден», «раздражён» и т.д.)',
+        );
+      } catch (err) {
+        this.logger.warn(
+          `Не удалось отправить STATE_CHECK пользователю ${user.id}:`,
+          (err as Error).message,
+        );
       }
-
-      // --- Локальные вычисления ---
-      const messageLength = trimmed.length;
-      const wordCount = trimmed.split(/\s+/).filter((w) => w.length > 0).length;
-      const typosCount = Math.max(0, Math.round(parsed.typosCount)); // целое ≥0
-      const primaryEmotion = String(parsed.primaryEmotion).toLowerCase();
-      const topicTag = String(parsed.topicTag)
-        .trim()
-        .toLowerCase()
-        .replace(/\s+/g, '_');
-      const sentimentScore = parseFloat(parsed.sentimentScore.toFixed(1));
-      const emotionalIntensity = Math.min(
-        10,
-        Math.max(1, Math.round(parsed.emotionalIntensity)),
-      );
-
-      const now = new Date();
-      const utcHours = String(now.getUTCHours()).padStart(2, '0');
-      const utcMinutes = String(now.getUTCMinutes()).padStart(2, '0');
-      const timestampStr = `${utcHours}:${utcMinutes}`;
-      const todayStart = new Date(
-        Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
-      );
-
-      // --- Обновление ---
-      let existing = await this.prisma.dailyStats.findUnique({
-        where: { userId_date: { userId, date: todayStart } },
-      });
-
-      if (existing) {
-        await this.prisma.dailyStats.update({
-          where: { id: existing.id },
-          data: {
-            messageCount: { increment: 1 },
-            totalMessageChars: { increment: messageLength },
-            emotions: [...(existing.emotions as string[]), primaryEmotion],
-            topics: [...(existing.topics as string[]), topicTag],
-            messageTimestamps: [
-              ...(existing.messageTimestamps as string[]),
-              timestampStr,
-            ],
-            messageWordCounts: [
-              ...(existing.messageWordCounts as number[]),
-              wordCount,
-            ],
-            typosPerMessage: [
-              ...(existing.typosPerMessage as number[]),
-              typosCount,
-            ], // ← здесь
-            sentimentScores: [
-              ...(existing.sentimentScores as number[]),
-              sentimentScore,
-            ],
-            emotionalIntensities: [
-              ...(existing.emotionalIntensities as number[]),
-              emotionalIntensity,
-            ],
-          },
-        });
-      } else {
-        await this.prisma.dailyStats.create({
-          data: {
-            userId,
-            date: todayStart,
-            messageCount: 1,
-            totalMessageChars: messageLength,
-            emotions: [primaryEmotion],
-            topics: [topicTag],
-            messageTimestamps: [timestampStr],
-            messageWordCounts: [wordCount],
-            typosPerMessage: [typosCount], // ← и здесь
-            sentimentScores: [sentimentScore],
-            emotionalIntensities: [emotionalIntensity],
-          },
-        });
-      }
-
-      this.logger.debug(`Обновлена дневная статистика для userId=${userId}`);
-    } catch (error) {
-      this.logger.error('Ошибка при обновлении DailyStats:', error.message);
     }
   }
 }
