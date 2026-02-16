@@ -63,32 +63,13 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       );
     });
 
-    this.bot.command('file', async (ctx) => {
-      try {
-        const userId = BigInt(ctx.from.id);
-        const interactions = await this.db.getInteractions(userId);
-
-        if (!interactions.length) {
-          await ctx.reply('Нет записей');
-          return;
-        }
-
-        const text = this.formatInteractions(interactions);
-        const filename = `analysis_${Date.now()}.txt`;
-        const filepath = path.join(process.cwd(), filename);
-
-        fs.writeFileSync(filepath, text);
-
-        await ctx.replyWithDocument({
-          source: filepath,
-          filename: filename,
-        });
-
-        fs.unlinkSync(filepath);
-      } catch (e) {
-        this.logger.error('Ошибка команды /file:', e);
-        await ctx.reply('Ошибка: ' + (e as Error).message);
+    this.bot.command('file', async (ctx: MyContext) => {
+      if (!ctx.session) {
+        ctx.session = {};
       }
+
+      ctx.session.awaitingFileDays = true;
+      await ctx.reply('За сколько дней выгрузить отчёт? (введите число)');
     });
 
     this.bot.command('analyze', async (ctx) => {
@@ -215,6 +196,17 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
       if (ctx.session?.postAnalysisMode) {
         return this.handlePostAnalysisMessage(ctx, userText);
+      }
+
+      if (ctx.session?.awaitingFileDays) {
+        ctx.session.awaitingFileDays = false;
+
+        // Парсим число или используем 10 по умолчанию
+        const days = /^\d+$/.test(userText.trim())
+          ? parseInt(userText.trim(), 10)
+          : 10;
+
+        return this.handleFileExport(ctx, days);
       }
 
       return this.handleRegularMessage(ctx, userText);
@@ -613,5 +605,180 @@ ${lastReport}
         );
       }
     }
+  }
+
+  private async handleFileExport(ctx: MyContext, days: number) {
+    try {
+      if (!ctx.from) {
+        return;
+      }
+
+      const userId = BigInt(ctx.from.id);
+
+      await ctx.reply(`🔄 Генерирую отчёт за ${days} дн...`);
+
+      // Получаем данные из БД
+      const interactions = await this.db.getInteractionsByPeriod(userId, days);
+
+      if (!interactions.length) {
+        await ctx.reply(`📭 Нет записей за последние ${days} дн.`);
+        return;
+      }
+
+      // Форматируем отчёт
+      const reportText = this.formatExportReport(interactions, days);
+
+      // Создаём временный файл
+      const filename = `report_${Date.now()}.txt`;
+      const filepath = path.join(process.cwd(), filename);
+
+      fs.writeFileSync(filepath, reportText, 'utf8');
+
+      // Отправляем файл
+      await ctx.replyWithDocument({
+        source: filepath,
+        filename: `отчёт_${days}дн_${new Date().toISOString().split('T')[0]}.txt`,
+      });
+
+      // Удаляем временный файл
+      fs.unlinkSync(filepath);
+
+      await ctx.reply(`✅ Готово. Записей в отчёте: ${interactions.length}`);
+    } catch (e) {
+      this.logger.error('Ошибка экспорта отчёта:', e);
+      await ctx.reply(`❌ Ошибка при создании отчёта: ${(e as Error).message}`);
+    }
+  }
+
+  // ==================== ВСПОМОГАТЕЛЬНЫЙ МЕТОД: formatExportReport ====================
+
+  private formatExportReport(interactions: any[], days: number): string {
+    const since = new Date();
+    since.setDate(since.getDate() - days);
+
+    const lines = [
+      `Отчёт за ${days} дн. (${since.toLocaleDateString('ru-RU')} – ${new Date().toLocaleDateString('ru-RU')})`,
+      `Всего записей: ${interactions.length}`,
+      '',
+    ];
+
+    for (const interaction of interactions) {
+      // Сообщение пользователя
+      if (interaction.userMessage?.content) {
+        const wrappedContent = this.wrapText(
+          interaction.userMessage.content.trim(),
+          76,
+        );
+        const indented = wrappedContent
+          .split('\n')
+          .map((line) => `    ${line}`)
+          .join('\n');
+        lines.push(`Пользователь:\n${indented}`);
+      }
+
+      // Ответ бота — структурированный анализ
+      lines.push('Бот: Анализ ситуации');
+      lines.push(`Триггер: ${this.wrapAndIndent(interaction.trigger, 76)}`);
+      lines.push(`Мысль: ${this.wrapAndIndent(interaction.thought, 76)}`);
+      lines.push(
+        `Эмоция: ${interaction.emotionName} (${interaction.emotionIntensity}/10)`,
+      );
+      lines.push(`Действие: ${this.wrapAndIndent(interaction.action, 76)}`);
+      lines.push(
+        `Последствие: ${this.wrapAndIndent(interaction.consequence, 76)}`,
+      );
+
+      // Паттерны
+      if (Array.isArray(interaction.patterns) && interaction.patterns?.length) {
+        lines.push(`Паттерны: ${interaction.patterns.join(', ')}`);
+      }
+
+      lines.push(`Цель: ${this.wrapAndIndent(interaction.goal, 76)}`);
+      lines.push(
+        `Причина неэффективности: ${this.wrapAndIndent(interaction.ineffectivenessReason, 76)}`,
+      );
+      lines.push(
+        `Скрытая потребность: ${this.wrapAndIndent(interaction.hiddenNeed, 76)}`,
+      );
+
+      // Физиология
+      if (interaction.physiology) {
+        try {
+          const phys =
+            typeof interaction.physiology === 'object'
+              ? interaction.physiology
+              : JSON.parse(interaction.physiology as string);
+          if (phys.mechanism) {
+            lines.push(`Физиология: ${this.wrapAndIndent(phys.mechanism, 76)}`);
+          }
+        } catch (e) {}
+      }
+
+      // Альтернативы
+      if (
+        Array.isArray(interaction.alternatives) &&
+        interaction.alternatives?.length
+      ) {
+        lines.push('Альтернативы:');
+        interaction.alternatives.forEach((alt: string, i: number) => {
+          const wrapped = this.wrapText(alt, 72);
+          wrapped.split('\n').forEach((line, idx) => {
+            if (idx === 0) {
+              lines.push(`    ${i + 1}. ${line}`);
+            } else {
+              lines.push(`       ${line}`);
+            }
+          });
+        });
+      }
+
+      lines.push(
+        `Дата анализа: ${interaction.createdAt.toLocaleString('ru-RU')}`,
+      );
+      lines.push('─'.repeat(80));
+      lines.push('');
+    }
+
+    return lines.join('\n');
+  }
+
+  // ==================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ====================
+
+  private wrapText(text: string, maxWidth = 80): string {
+    if (!text) return '';
+
+    const paragraphs = text.split('\n');
+
+    const wrappedParagraphs = paragraphs.map((paragraph) => {
+      if (!paragraph.trim()) return '';
+
+      const words = paragraph.trim().split(/\s+/);
+      const lines: string[] = [];
+      let currentLine = '';
+
+      for (const word of words) {
+        if (
+          currentLine.length + word.length + (currentLine ? 1 : 0) <=
+          maxWidth
+        ) {
+          currentLine = currentLine ? `${currentLine} ${word}` : word;
+        } else {
+          if (currentLine) lines.push(currentLine);
+          currentLine = word;
+        }
+      }
+
+      if (currentLine) lines.push(currentLine);
+      return lines.join('\n');
+    });
+
+    return wrappedParagraphs.join('\n');
+  }
+
+  private wrapAndIndent(text: string, maxWidth: number): string {
+    return this.wrapText(text, maxWidth)
+      .split('\n')
+      .map((line) => `    ${line}`)
+      .join('\n');
   }
 }

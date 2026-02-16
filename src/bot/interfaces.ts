@@ -8,6 +8,7 @@ interface MySession {
   awaitingRuleContent?: boolean;
   awaitingRuleDescription?: boolean;
   ruleContent?: string;
+  awaitingFileDays?: boolean;
 }
 
 export type MyContext = Context & { session: MySession };

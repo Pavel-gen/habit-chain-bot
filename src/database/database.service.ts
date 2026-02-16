@@ -238,6 +238,20 @@ export class DatabaseService {
     return false;
   }
 
+  async getInteractionsByPeriod(userId: bigint, days: number): Promise<any[]> {
+    const since = new Date();
+    since.setDate(since.getDate() - days);
+
+    return this.prisma.interaction.findMany({
+      where: {
+        userId,
+        createdAt: { gte: since },
+      },
+      orderBy: { createdAt: 'desc' },
+      include: { userMessage: true },
+    });
+  }
+
   async generateBehaviorReport(
     userId: bigint,
     llm: LlmService,
